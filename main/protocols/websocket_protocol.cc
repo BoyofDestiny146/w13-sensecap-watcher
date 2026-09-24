@@ -81,6 +81,10 @@ bool WebsocketProtocol::OpenAudioChannel() {
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
     int version = settings.GetInt("version");
+    if (url.empty()) {
+        url = "wss://ws.nexus.warehouse-13.biz/xiaozhi/v1/";
+    }
+
     if (version != 0) {
         version_ = version;
     }
