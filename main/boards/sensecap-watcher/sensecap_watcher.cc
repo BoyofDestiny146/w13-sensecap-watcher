@@ -235,6 +235,51 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             }
         }
 
+        void AssertW13LowBatteryStyle(const lv_font_t* text_font) {
+            if (low_battery_popup_ == nullptr || low_battery_label_ == nullptr) {
+                return;
+            }
+
+            // Parent LcdDisplay::SetTheme may overwrite popup bg to theme low_battery_color.
+            lv_obj_set_style_bg_color(low_battery_popup_, lv_color_hex(0x000000), 0);
+            lv_obj_set_style_bg_opa(low_battery_popup_, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(low_battery_popup_, 0, 0);
+            lv_obj_set_style_radius(low_battery_popup_, 0, 0);
+
+            lv_label_set_text(low_battery_label_, "BATTERY LOW");
+            lv_obj_set_style_text_color(low_battery_label_, lv_color_hex(0xF01818), 0);
+            if (text_font != nullptr) {
+                lv_obj_set_style_text_font(low_battery_label_, text_font, 0);
+            }
+            lv_obj_set_style_text_letter_space(low_battery_label_, 3, 0);
+            lv_obj_set_style_text_align(low_battery_label_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_move_foreground(low_battery_label_);
+        }
+
+        void RebindW13TextFonts(const lv_font_t* text_font) {
+            if (text_font == nullptr) {
+                return;
+            }
+            if (w13_logo_ != nullptr) {
+                lv_obj_set_style_text_font(w13_logo_, text_font, 0);
+            }
+            if (w13_state_ != nullptr) {
+                lv_obj_set_style_text_font(w13_state_, text_font, 0);
+            }
+            if (wifi_title_ != nullptr) {
+                lv_obj_set_style_text_font(wifi_title_, text_font, 0);
+            }
+            if (wifi_ssid_ != nullptr) {
+                lv_obj_set_style_text_font(wifi_ssid_, text_font, 0);
+            }
+            if (wifi_url_ != nullptr) {
+                lv_obj_set_style_text_font(wifi_url_, text_font, 0);
+            }
+            if (low_battery_label_ != nullptr) {
+                lv_obj_set_style_text_font(low_battery_label_, text_font, 0);
+            }
+        }
+
         void SetupW13LowBatteryUi(const lv_font_t* text_font) {
             if (low_battery_popup_ == nullptr || low_battery_label_ == nullptr) {
                 return;
@@ -243,10 +288,6 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             // Full-screen black W-13 low-battery surface (no stock white popup).
             lv_obj_set_size(low_battery_popup_, LV_HOR_RES, LV_VER_RES);
             lv_obj_align(low_battery_popup_, LV_ALIGN_CENTER, 0, 0);
-            lv_obj_set_style_bg_color(low_battery_popup_, lv_color_hex(0x000000), 0);
-            lv_obj_set_style_bg_opa(low_battery_popup_, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(low_battery_popup_, 0, 0);
-            lv_obj_set_style_radius(low_battery_popup_, 0, 0);
             lv_obj_set_style_pad_all(low_battery_popup_, 0, 0);
             lv_obj_clear_flag(low_battery_popup_, LV_OBJ_FLAG_SCROLLABLE);
             lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
@@ -258,15 +299,10 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             StartRingAnimation(low_bat_middle_ring_, 1900, 300);
             StartRingAnimation(low_bat_inner_ring_, 1400, 600);
 
-            lv_label_set_text(low_battery_label_, "BATTERY LOW");
-            lv_obj_set_style_text_color(low_battery_label_, lv_color_hex(0xF01818), 0);
-            lv_obj_set_style_text_font(low_battery_label_, text_font, 0);
-            lv_obj_set_style_text_letter_space(low_battery_label_, 3, 0);
             lv_obj_set_width(low_battery_label_, LV_HOR_RES * 0.8);
-            lv_obj_set_style_text_align(low_battery_label_, LV_TEXT_ALIGN_CENTER, 0);
             lv_label_set_long_mode(low_battery_label_, LV_LABEL_LONG_WRAP);
             lv_obj_align(low_battery_label_, LV_ALIGN_CENTER, 0, 0);
-            lv_obj_move_foreground(low_battery_label_);
+            AssertW13LowBatteryStyle(text_font);
         }
 
         void SetPanelDisplayOn(bool on) {
@@ -496,6 +532,22 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 esp_timer_start_once(
                     intro_timer_,
                     6000000));
+        }
+
+        // Rebind W-13 label fonts after Assets::Apply / SetTextFont theme refresh
+        // so raw LVGL font pointers are not left dangling when previous owners reset.
+        virtual void SetTheme(Theme* theme) override {
+            LcdDisplay::SetTheme(theme);
+
+            DisplayLockGuard lock(this);
+            auto lvgl_theme = static_cast<LvglTheme*>(theme);
+            if (lvgl_theme == nullptr || lvgl_theme->text_font() == nullptr) {
+                return;
+            }
+
+            const lv_font_t* text_font = lvgl_theme->text_font()->font();
+            RebindW13TextFonts(text_font);
+            AssertW13LowBatteryStyle(text_font);
         }
 
         // Screen-off listening: keep W-13 UI; do not fall back to stock sleepy emotion.
