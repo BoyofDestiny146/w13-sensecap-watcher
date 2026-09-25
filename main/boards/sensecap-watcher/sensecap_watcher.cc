@@ -47,8 +47,14 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         lv_obj_t* wifi_ssid_ = nullptr;
         lv_obj_t* wifi_url_ = nullptr;
 
+        // W-13 low-battery overlay (replaces stock white popup visuals)
+        lv_obj_t* low_bat_outer_ring_ = nullptr;
+        lv_obj_t* low_bat_middle_ring_ = nullptr;
+        lv_obj_t* low_bat_inner_ring_ = nullptr;
+
         esp_timer_handle_t intro_timer_ = nullptr;
         bool intro_finished_ = false;
+        bool panel_display_off_ = false;
         std::string pending_wifi_message_;
 
         static void RingAnim(void* obj, int32_t value) {
@@ -229,6 +235,57 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             }
         }
 
+        void SetupW13LowBatteryUi(const lv_font_t* text_font) {
+            if (low_battery_popup_ == nullptr || low_battery_label_ == nullptr) {
+                return;
+            }
+
+            // Full-screen black W-13 low-battery surface (no stock white popup).
+            lv_obj_set_size(low_battery_popup_, LV_HOR_RES, LV_VER_RES);
+            lv_obj_align(low_battery_popup_, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_set_style_bg_color(low_battery_popup_, lv_color_hex(0x000000), 0);
+            lv_obj_set_style_bg_opa(low_battery_popup_, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(low_battery_popup_, 0, 0);
+            lv_obj_set_style_radius(low_battery_popup_, 0, 0);
+            lv_obj_set_style_pad_all(low_battery_popup_, 0, 0);
+            lv_obj_clear_flag(low_battery_popup_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
+
+            low_bat_outer_ring_ = CreateRing(low_battery_popup_, 406, 5, 0x18E7F2);
+            low_bat_middle_ring_ = CreateRing(low_battery_popup_, 392, 4, 0x19BCEB);
+            low_bat_inner_ring_ = CreateRing(low_battery_popup_, 378, 3, 0x68FFF2);
+            StartRingAnimation(low_bat_outer_ring_, 2600, 0);
+            StartRingAnimation(low_bat_middle_ring_, 1900, 300);
+            StartRingAnimation(low_bat_inner_ring_, 1400, 600);
+
+            lv_label_set_text(low_battery_label_, "BATTERY LOW");
+            lv_obj_set_style_text_color(low_battery_label_, lv_color_hex(0xF01818), 0);
+            lv_obj_set_style_text_font(low_battery_label_, text_font, 0);
+            lv_obj_set_style_text_letter_space(low_battery_label_, 3, 0);
+            lv_obj_set_width(low_battery_label_, LV_HOR_RES * 0.8);
+            lv_obj_set_style_text_align(low_battery_label_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_label_set_long_mode(low_battery_label_, LV_LABEL_LONG_WRAP);
+            lv_obj_align(low_battery_label_, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_move_foreground(low_battery_label_);
+        }
+
+        void SetPanelDisplayOn(bool on) {
+            if (panel_ == nullptr) {
+                return;
+            }
+            esp_err_t err = esp_lcd_panel_disp_on_off(panel_, on);
+            if (err == ESP_ERR_NOT_SUPPORTED) {
+                ESP_LOGW(TAG, "Panel does not support disp_on_off; backlight-only screen-off");
+                return;
+            }
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "esp_lcd_panel_disp_on_off(%s) failed: %s",
+                         on ? "on" : "off", esp_err_to_name(err));
+                return;
+            }
+            panel_display_off_ = !on;
+        }
+
     public:
         CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle, 
                         esp_lcd_panel_handle_t panel_handle,
@@ -285,11 +342,6 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             lv_obj_align(notification_label_, LV_ALIGN_BOTTOM_MID, 0, 0);
             lv_obj_set_width(notification_label_, LV_HOR_RES * 0.75);
             lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
-
-            lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -20);
-            lv_obj_set_style_bg_color(low_battery_popup_, lv_color_hex(0xFF0000), 0);
-            lv_obj_set_width(low_battery_label_, LV_HOR_RES * 0.75);
-            lv_label_set_long_mode(low_battery_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
 
             // 针对圆形屏幕调整底部对话框位置，避免被圆角遮挡
             lv_obj_set_style_pad_bottom(bottom_bar_, 30, 0);
@@ -422,6 +474,9 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             lv_obj_add_flag(
                 wifi_url_, LV_OBJ_FLAG_HIDDEN);
 
+            // Replace stock low-battery popup with W-13 language.
+            SetupW13LowBatteryUi(text_font);
+
             // Start with the branded W-13/NEXUS introduction.
             ShowIntroScreen();
 
@@ -441,6 +496,47 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 esp_timer_start_once(
                     intro_timer_,
                     6000000));
+        }
+
+        // Screen-off listening: keep W-13 UI; do not fall back to stock sleepy emotion.
+        virtual void SetPowerSaveMode(bool on) override {
+            DisplayLockGuard lock(this);
+            if (on) {
+                SetPanelDisplayOn(false);
+                ShowW13Home();
+                if (wifi_title_ == nullptr ||
+                    lv_obj_has_flag(wifi_title_, LV_OBJ_FLAG_HIDDEN)) {
+                    SetW13State("STANDBY");
+                }
+            } else {
+                SetPanelDisplayOn(true);
+                ShowW13Home();
+                if (wifi_title_ != nullptr &&
+                    !lv_obj_has_flag(wifi_title_, LV_OBJ_FLAG_HIDDEN)) {
+                    // Keep Wi-Fi setup screen visible after wake.
+                    if (w13_layer_ != nullptr) {
+                        lv_obj_move_foreground(w13_layer_);
+                    }
+                } else {
+                    SetW13State("NEXUS");
+                    if (outer_ring_ != nullptr) {
+                        lv_obj_set_style_arc_color(
+                            outer_ring_,
+                            lv_color_hex(0x18E7F2),
+                            LV_PART_INDICATOR);
+                    }
+                }
+            }
+        }
+
+        virtual void UpdateStatusBar(bool update_all = false) override {
+            LvglDisplay::UpdateStatusBar(update_all);
+            DisplayLockGuard lock(this);
+            if (low_battery_popup_ != nullptr &&
+                !lv_obj_has_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN)) {
+                // Keep W-13 low-battery overlay above home layer when active.
+                lv_obj_move_foreground(low_battery_popup_);
+            }
         }
 
         virtual void SetStatus(const char* status) override {
@@ -544,25 +640,23 @@ private:
     SscmaCamera* camera_ = nullptr;
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // Screen-off + listening: cpu_max_freq=-1 keeps wake-word and mic alive.
+        // seconds_to_shutdown=-1 disables the old 300s BSP_PWR_SYSTEM cut.
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
+            ESP_LOGI(TAG, "Enter screen-off listening mode");
+            // Backlight first so the panel-off transition is not visible.
+            GetBacklight()->SetBrightness(0);
+            // SetPowerSaveMode restores W-13 UI and blanks the panel when supported.
+            // Does not touch Wi-Fi, mic, wake-word, BSP_PWR_LCD, or BSP_PWR_CODEC_PA.
             GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(10);
         });
         power_save_timer_->OnExitSleepMode([this]() {
+            ESP_LOGI(TAG, "Exit screen-off listening mode");
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
         });
-        power_save_timer_->OnShutdownRequest([this]() {
-            ESP_LOGI(TAG, "Shutting down");
-            bool is_charging = (IoExpanderGetLevel(BSP_PWR_VBUS_IN_DET) == 0);
-            if (is_charging) {
-                ESP_LOGI(TAG, "charging");
-                GetBacklight()->SetBrightness(0);
-            } else {
-                IoExpanderSetLevel(BSP_PWR_SYSTEM, 0);
-            }
-        });
+        // No OnShutdownRequest: screen-off listening must not cut BSP_PWR_SYSTEM.
         power_save_timer_->SetEnabled(true);
     }
 
