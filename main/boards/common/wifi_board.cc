@@ -54,19 +54,13 @@ void WifiBoard::StartNetwork() {
 
     // Initialize WiFi manager
     WifiManagerConfig config;
-    config.ssid_prefix = "Xiaozhi";
+    config.ssid_prefix = "Nexus-1984";
     config.language = Lang::CODE;
     config.show_ota_config = true;
     config.show_sleep_config = true;
 
-    // Set a DHCP hostname so the router shows a friendly name instead of "espressif".
-    // Uses the same "<prefix>-<last 2 MAC bytes>" scheme as the config AP SSID.
-    uint8_t mac[6];
-    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
-        char hostname[32];
-        snprintf(hostname, sizeof(hostname), "%s-%02X%02X", config.ssid_prefix.c_str(), mac[4], mac[5]);
-        config.station_hostname = hostname;
-    }
+    // W-13 / Nexus build: fixed friendly DHCP hostname.
+    config.station_hostname = "Nexus-1984";
     wifi_manager.Initialize(config);
 
     // Set unified event callback - forward to NetworkEvent with SSID data

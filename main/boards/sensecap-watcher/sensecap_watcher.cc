@@ -34,6 +34,201 @@
 #define TAG "sensecap_watcher"
 
 class CustomLcdDisplay : public SpiLcdDisplay {
+    private:
+        lv_obj_t* w13_layer_ = nullptr;
+        lv_obj_t* outer_ring_ = nullptr;
+        lv_obj_t* middle_ring_ = nullptr;
+        lv_obj_t* inner_ring_ = nullptr;
+        lv_obj_t* w13_logo_ = nullptr;
+        lv_obj_t* w13_state_ = nullptr;
+
+        // W-13 Wi-Fi provisioning UI
+        lv_obj_t* wifi_title_ = nullptr;
+        lv_obj_t* wifi_ssid_ = nullptr;
+        lv_obj_t* wifi_url_ = nullptr;
+
+        esp_timer_handle_t intro_timer_ = nullptr;
+        bool intro_finished_ = false;
+        std::string pending_wifi_message_;
+
+        static void RingAnim(void* obj, int32_t value) {
+            lv_arc_set_value(static_cast<lv_obj_t*>(obj), value);
+        }
+
+        void StartRingAnimation(lv_obj_t* ring, uint32_t duration, uint32_t delay = 0) {
+            lv_anim_t a;
+            lv_anim_init(&a);
+            lv_anim_set_var(&a, ring);
+            lv_anim_set_exec_cb(&a, RingAnim);
+            lv_anim_set_values(&a, 0, 100);
+            lv_anim_set_duration(&a, duration);
+            lv_anim_set_delay(&a, delay);
+            lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+            lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+            lv_anim_start(&a);
+        }
+
+        lv_obj_t* CreateRing(lv_obj_t* parent, int size, int width, uint32_t color) {
+            lv_obj_t* ring = lv_arc_create(parent);
+            lv_obj_set_size(ring, size, size);
+            lv_obj_center(ring);
+
+            lv_arc_set_range(ring, 0, 100);
+            lv_arc_set_bg_angles(ring, 0, 360);
+            lv_arc_set_rotation(ring, 270);
+            lv_arc_set_value(ring, 70);
+
+            lv_obj_remove_style(ring, nullptr, LV_PART_KNOB);
+
+            lv_obj_set_style_arc_width(ring, width, LV_PART_MAIN);
+            lv_obj_set_style_arc_color(
+                ring, lv_color_hex(0x073844), LV_PART_MAIN);
+            lv_obj_set_style_arc_opa(ring, LV_OPA_60, LV_PART_MAIN);
+
+            lv_obj_set_style_arc_width(ring, width, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(
+                ring, lv_color_hex(color), LV_PART_INDICATOR);
+            lv_obj_set_style_arc_opa(ring, LV_OPA_COVER, LV_PART_INDICATOR);
+
+            return ring;
+        }
+
+        void SetW13State(const char* text) {
+            if (w13_state_ != nullptr) {
+                lv_label_set_text(w13_state_, text);
+            }
+        }
+
+        static void IntroTimerCallback(void* arg) {
+            auto self = static_cast<CustomLcdDisplay*>(arg);
+            self->intro_finished_ = true;
+
+            DisplayLockGuard lock(self);
+
+            if (!self->pending_wifi_message_.empty()) {
+                self->ShowWifiScreenFromMessage(
+                    self->pending_wifi_message_.c_str());
+            }
+        }
+
+        void ShowIntroScreen() {
+            ShowW13Home();
+
+            if (w13_logo_ != nullptr)
+                lv_obj_remove_flag(w13_logo_, LV_OBJ_FLAG_HIDDEN);
+
+            if (w13_state_ != nullptr) {
+                lv_label_set_text(w13_state_, "NEXUS");
+                lv_obj_remove_flag(w13_state_, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            if (wifi_title_ != nullptr)
+                lv_obj_add_flag(wifi_title_, LV_OBJ_FLAG_HIDDEN);
+
+            if (wifi_ssid_ != nullptr)
+                lv_obj_add_flag(wifi_ssid_, LV_OBJ_FLAG_HIDDEN);
+
+            if (wifi_url_ != nullptr)
+                lv_obj_add_flag(wifi_url_, LV_OBJ_FLAG_HIDDEN);
+
+            if (w13_layer_ != nullptr)
+                lv_obj_move_foreground(w13_layer_);
+        }
+
+        void ShowWifiScreen(const char* ssid, const char* url) {
+            ShowW13Home();
+
+            if (w13_logo_ != nullptr)
+                lv_obj_add_flag(w13_logo_, LV_OBJ_FLAG_HIDDEN);
+
+            if (w13_state_ != nullptr)
+                lv_obj_add_flag(w13_state_, LV_OBJ_FLAG_HIDDEN);
+
+            if (wifi_title_ != nullptr) {
+                lv_label_set_text(wifi_title_, "WI-FI SETUP");
+                lv_obj_remove_flag(wifi_title_, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            if (wifi_ssid_ != nullptr) {
+                lv_label_set_text_fmt(
+                    wifi_ssid_, "HOTSPOT\n%s",
+                    (ssid != nullptr) ? ssid : "");
+                lv_obj_remove_flag(wifi_ssid_, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            if (wifi_url_ != nullptr) {
+                lv_label_set_text_fmt(
+                    wifi_url_, "OPEN IN BROWSER\n%s",
+                    (url != nullptr) ? url : "");
+                lv_obj_remove_flag(wifi_url_, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            if (w13_layer_ != nullptr)
+                lv_obj_move_foreground(w13_layer_);
+        }
+
+        void ShowWifiScreenFromMessage(const char* message) {
+            if (message == nullptr)
+                return;
+
+            std::string msg(message);
+            std::string ssid;
+            std::string url;
+
+            const std::string hotspot_tag = "Hotspot: ";
+            const std::string url_tag = " Config URL: ";
+
+            auto hp = msg.find(hotspot_tag);
+            auto up = msg.find(url_tag);
+
+            if (hp != std::string::npos) {
+                hp += hotspot_tag.size();
+
+                if (up != std::string::npos && up > hp) {
+                    ssid = msg.substr(hp, up - hp);
+                    url = msg.substr(up + url_tag.size());
+                } else {
+                    ssid = msg.substr(hp);
+                }
+            }
+
+            ShowWifiScreen(
+                ssid.empty() ? "Xiaozhi" : ssid.c_str(),
+                url.empty() ? "http://192.168.4.1" : url.c_str());
+        }
+
+        void ShowStockUiForSetup() {
+            if (w13_layer_ != nullptr)
+                lv_obj_add_flag(w13_layer_, LV_OBJ_FLAG_HIDDEN);
+
+            if (container_ != nullptr)
+                lv_obj_remove_flag(container_, LV_OBJ_FLAG_HIDDEN);
+            if (top_bar_ != nullptr)
+                lv_obj_remove_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
+            if (status_bar_ != nullptr)
+                lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+            if (bottom_bar_ != nullptr)
+                lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        void ShowW13Home() {
+            if (container_ != nullptr)
+                lv_obj_add_flag(container_, LV_OBJ_FLAG_HIDDEN);
+            if (emoji_box_ != nullptr)
+                lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+            if (top_bar_ != nullptr)
+                lv_obj_add_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
+            if (status_bar_ != nullptr)
+                lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+            if (bottom_bar_ != nullptr)
+                lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+
+            if (w13_layer_ != nullptr) {
+                lv_obj_remove_flag(w13_layer_, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(w13_layer_);
+            }
+        }
+
     public:
         CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle, 
                         esp_lcd_panel_handle_t panel_handle,
@@ -99,6 +294,237 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             // 针对圆形屏幕调整底部对话框位置，避免被圆角遮挡
             lv_obj_set_style_pad_bottom(bottom_bar_, 30, 0);
             lv_obj_set_width(chat_message_label_, LV_HOR_RES * 0.75); // 限制宽度，避免文字贴边
+
+            // =========================================================
+            // Warehouse 13 / Nexus animated Watcher interface
+            // =========================================================
+
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+
+            // W-13 is a full-screen overlay on the ROOT LVGL screen.
+            // Do not attach it to content_; the stock Watcher UI uses
+            // separate screen-level top/status/bottom layers.
+            lv_obj_t* screen = lv_screen_active();
+
+            w13_layer_ = lv_obj_create(screen);
+            lv_obj_remove_style_all(w13_layer_);
+            lv_obj_set_pos(w13_layer_, 0, 0);
+            lv_obj_set_size(w13_layer_, LV_HOR_RES, LV_VER_RES);
+            lv_obj_move_foreground(w13_layer_);
+            lv_obj_set_style_bg_color(
+                w13_layer_, lv_color_hex(0x000000), 0);
+            lv_obj_set_style_bg_opa(
+                w13_layer_, LV_OPA_COVER, 0);
+            lv_obj_clear_flag(w13_layer_, LV_OBJ_FLAG_SCROLLABLE);
+
+            // Hide the normal XiaoZhi Watcher interface.
+            if (container_ != nullptr)
+                lv_obj_add_flag(container_, LV_OBJ_FLAG_HIDDEN);
+            if (emoji_box_ != nullptr)
+                lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+            if (top_bar_ != nullptr)
+                lv_obj_add_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
+            if (status_bar_ != nullptr)
+                lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+            if (bottom_bar_ != nullptr)
+                lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+
+            // Make absolutely certain W-13 remains the top layer.
+            lv_obj_move_foreground(w13_layer_);
+
+            // W-13 perimeter animation for the 412 x 412 Watcher.
+            // Outer arc is only a few pixels inside the physical rim.
+            outer_ring_ = CreateRing(
+                w13_layer_, 406, 5, 0x18E7F2);
+
+            middle_ring_ = CreateRing(
+                w13_layer_, 392, 4, 0x19BCEB);
+
+            inner_ring_ = CreateRing(
+                w13_layer_, 378, 3, 0x68FFF2);
+
+            StartRingAnimation(outer_ring_, 2600, 0);
+            StartRingAnimation(middle_ring_, 1900, 300);
+            StartRingAnimation(inner_ring_, 1400, 600);
+
+            // W-13 center mark
+            w13_logo_ = lv_label_create(w13_layer_);
+            lv_label_set_text(w13_logo_, "W-13");
+            lv_obj_set_style_text_color(
+                w13_logo_, lv_color_hex(0xF01818), 0);
+            lv_obj_set_style_text_font(
+                w13_logo_, text_font, 0);
+            lv_obj_set_style_text_letter_space(
+                w13_logo_, 4, 0);
+            lv_obj_set_style_transform_scale(
+                w13_logo_, 125, 0);
+            lv_obj_align(
+                w13_logo_, LV_ALIGN_CENTER, 0, -6);
+
+            // State caption
+            w13_state_ = lv_label_create(w13_layer_);
+            lv_label_set_text(w13_state_, "NEXUS");
+            lv_obj_set_style_text_color(
+                w13_state_, lv_color_hex(0x8EFAFF), 0);
+            lv_obj_set_style_text_font(
+                w13_state_, text_font, 0);
+            lv_obj_set_style_text_letter_space(
+                w13_state_, 2, 0);
+            lv_obj_set_style_transform_scale(
+                w13_state_, 112, 0);
+            lv_obj_align(
+                w13_state_, LV_ALIGN_CENTER, 0, 42);
+
+            // -------------------------------------------------
+            // Custom W-13 Wi-Fi provisioning screen
+            // -------------------------------------------------
+
+            wifi_title_ = lv_label_create(w13_layer_);
+            lv_label_set_text(wifi_title_, "WI-FI SETUP");
+            lv_obj_set_style_text_color(
+                wifi_title_, lv_color_hex(0x7CFAFF), 0);
+            lv_obj_set_style_text_font(
+                wifi_title_, text_font, 0);
+            lv_obj_set_style_text_letter_space(
+                wifi_title_, 2, 0);
+            lv_obj_align(
+                wifi_title_, LV_ALIGN_CENTER, 0, -75);
+            lv_obj_add_flag(
+                wifi_title_, LV_OBJ_FLAG_HIDDEN);
+
+            wifi_ssid_ = lv_label_create(w13_layer_);
+            lv_label_set_text(wifi_ssid_, "");
+            lv_obj_set_width(wifi_ssid_, 300);
+            lv_obj_set_style_text_color(
+                wifi_ssid_, lv_color_hex(0x18E7F2), 0);
+            lv_obj_set_style_text_font(
+                wifi_ssid_, text_font, 0);
+            lv_obj_set_style_text_align(
+                wifi_ssid_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(
+                wifi_ssid_, LV_ALIGN_CENTER, 0, -10);
+            lv_obj_add_flag(
+                wifi_ssid_, LV_OBJ_FLAG_HIDDEN);
+
+            wifi_url_ = lv_label_create(w13_layer_);
+            lv_label_set_text(wifi_url_, "");
+            lv_obj_set_width(wifi_url_, 320);
+            lv_obj_set_style_text_color(
+                wifi_url_, lv_color_hex(0xA8FFFF), 0);
+            lv_obj_set_style_text_font(
+                wifi_url_, text_font, 0);
+            lv_obj_set_style_text_align(
+                wifi_url_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_label_set_long_mode(
+                wifi_url_, LV_LABEL_LONG_WRAP);
+            lv_obj_align(
+                wifi_url_, LV_ALIGN_CENTER, 0, 70);
+            lv_obj_add_flag(
+                wifi_url_, LV_OBJ_FLAG_HIDDEN);
+
+            // Start with the branded W-13/NEXUS introduction.
+            ShowIntroScreen();
+
+            // Hold intro for a minimum of six seconds.
+            esp_timer_create_args_t intro_args = {};
+            intro_args.callback = IntroTimerCallback;
+            intro_args.arg = this;
+            intro_args.dispatch_method = ESP_TIMER_TASK;
+            intro_args.name = "w13_intro";
+
+            ESP_ERROR_CHECK(
+                esp_timer_create(
+                    &intro_args,
+                    &intro_timer_));
+
+            ESP_ERROR_CHECK(
+                esp_timer_start_once(
+                    intro_timer_,
+                    6000000));
+        }
+
+        virtual void SetStatus(const char* status) override {
+            SpiLcdDisplay::SetStatus(status);
+
+            if (status == nullptr) {
+                return;
+            }
+
+            DisplayLockGuard lock(this);
+
+            // Never show stock white UI for Wi-Fi setup.
+            // Keep W-13 intro up until 6-second timer completes.
+            if (strcmp(status, Lang::Strings::WIFI_CONFIG_MODE) == 0 ||
+                strcmp(status, Lang::Strings::ENTERING_WIFI_CONFIG_MODE) == 0) {
+
+                if (!intro_finished_) {
+                    ShowIntroScreen();
+                }
+                return;
+            }
+
+            ShowW13Home();
+
+            if (w13_state_ == nullptr) {
+                return;
+            }
+
+            if (strcmp(status, Lang::Strings::LISTENING) == 0) {
+                SetW13State("LISTENING");
+
+                lv_obj_set_style_arc_color(
+                    outer_ring_,
+                    lv_color_hex(0x35F4FF),
+                    LV_PART_INDICATOR);
+
+            } else if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
+                SetW13State("SPEAKING");
+
+                lv_obj_set_style_arc_color(
+                    outer_ring_,
+                    lv_color_hex(0x16C7F3),
+                    LV_PART_INDICATOR);
+
+            } else {
+                SetW13State("NEXUS");
+
+                lv_obj_set_style_arc_color(
+                    outer_ring_,
+                    lv_color_hex(0x18E7F2),
+                    LV_PART_INDICATOR);
+            }
+        }
+
+        virtual void SetChatMessage(
+            const char* role,
+            const char* content) override {
+
+            // Capture Wi-Fi provisioning message before stock UI renders it.
+            if (role != nullptr &&
+                content != nullptr &&
+                strcmp(role, "system") == 0 &&
+                strstr(content, "Hotspot: ") != nullptr) {
+
+                pending_wifi_message_ = content;
+
+                DisplayLockGuard lock(this);
+
+                if (intro_finished_) {
+                    ShowWifiScreenFromMessage(content);
+                } else {
+                    ShowIntroScreen();
+                }
+
+                return;
+            }
+
+            // Suppress stock system text while W-13 UI is active.
+            if (role != nullptr &&
+                strcmp(role, "system") == 0) {
+                return;
+            }
+
+            SpiLcdDisplay::SetChatMessage(role, content);
         }
 };
 
