@@ -1,5 +1,8 @@
 tmp/
-components/
+# Ignore IDF component drop-ins, but keep the Nexus-1984 SSID override.
+components/*
+!components/esp-wifi-connect/
+!components/esp-wifi-connect/**
 managed_components/
 build/
 dist/
