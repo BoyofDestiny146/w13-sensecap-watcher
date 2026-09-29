@@ -34,6 +34,7 @@
 #include <cctype>
 #include <ctime>
 #include <cstring>
+#include <vector>
 #include <material_symbols.h>
 
 #include "assets/lang_config.h"
@@ -365,6 +366,33 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lv_obj_move_foreground(perimeter_b_);
         }
 
+        // Replaces stock white "Initializing..." — black + frozen perimeter + NEXUS.
+        // No status row, no right-side controls, no animation. Screens 1–6 unchanged.
+        void ShowBootInitializingScreen() {
+            screen_ = V4Screen::Boot;
+            ready_splash_active_ = false;
+            ShowV4Layer();
+            HideAllContent();
+
+            if (nexus_logo_ != nullptr) {
+                lv_label_set_text(nexus_logo_, "NEXUS");
+                lv_obj_set_style_text_color(nexus_logo_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_text_letter_space(nexus_logo_, 4, 0);
+                // True center (MAIN uses x=-30 to clear side icons).
+                lv_obj_align(nexus_logo_, LV_ALIGN_CENTER, 0, -16);
+                lv_obj_remove_flag(nexus_logo_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (subtitle_label_ != nullptr) {
+                lv_label_set_text(subtitle_label_, Lang::Strings::INITIALIZING);
+                lv_obj_set_style_text_color(subtitle_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_text_letter_space(subtitle_label_, 0, 0);
+                lv_obj_set_width(subtitle_label_, LV_SIZE_CONTENT);
+                lv_obj_align(subtitle_label_, LV_ALIGN_CENTER, 0, 28);
+                lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            BringPerimeterFront();
+        }
+
         void ShowProvisionQrScreen() {
             screen_ = V4Screen::ProvisionQr;
             ready_splash_active_ = false;
@@ -608,6 +636,8 @@ class CustomLcdDisplay : public SpiLcdDisplay {
 
             if (nexus_logo_ != nullptr) {
                 lv_label_set_text(nexus_logo_, "NEXUS");
+                lv_obj_set_style_text_letter_space(nexus_logo_, 4, 0);
+                lv_obj_align(nexus_logo_, LV_ALIGN_CENTER, -30, 0);
                 lv_obj_remove_flag(nexus_logo_, LV_OBJ_FLAG_HIDDEN);
             }
 
@@ -685,7 +715,11 @@ class CustomLcdDisplay : public SpiLcdDisplay {
 
         void RestoreV4ScreenForDeviceState() {
 #if W13_V4_UI_BENCH_MODE
-            ShowBenchScreenIndex(bench_index_);
+            if (screen_ == V4Screen::Boot) {
+                ShowBootInitializingScreen();
+            } else {
+                ShowBenchScreenIndex(bench_index_);
+            }
             return;
 #endif
             auto state = Application::GetInstance().GetDeviceState();
@@ -814,6 +848,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         virtual void SetupUI() override {
             SpiLcdDisplay::SetupUI();
 
+            {
             DisplayLockGuard lock(this);
             auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
             auto text_font = lvgl_theme->text_font()->font();
@@ -927,13 +962,15 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ready_args.name = "v4_ready";
             ESP_ERROR_CHECK(esp_timer_create(&ready_args, &ready_timer_));
 
+            // V4 boot UI first (backlight still off until this returns to the board).
+            ShowBootInitializingScreen();
 #if W13_V4_UI_BENCH_MODE
-            ESP_LOGW(TAG, "V4 UI BENCH MODE ON — knob rotate cycles 6 screens; click=Talk");
-            ShowBenchScreenIndex(0);
-#else
-            // Boot: show main-style branding until real state events arrive.
-            ShowMainScreen();
+            ESP_LOGW(TAG, "V4 UI BENCH MODE ON — boot shown; knob rotate cycles 6 screens; click=Talk");
 #endif
+            }
+
+            // Preferred white-flash kill: light panel only after V4 boot is composed.
+            Board::GetInstance().GetBacklight()->RestoreBrightness();
         }
 
         // TEMPORARY bench API: knob rotation cycles the 6 V4 screens for photo validation.
@@ -945,6 +982,11 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             }
             last_bench_cycle_us_ = now;
             DisplayLockGuard lock(this);
+            // First rotation leaves the boot initializing screen and enters Screen 1–6.
+            if (screen_ == V4Screen::Boot) {
+                ShowBenchScreenIndex(clockwise ? 0 : (kBenchScreenCount - 1));
+                return;
+            }
             ShowBenchScreenIndex(bench_index_ + (clockwise ? 1 : -1));
 #else
             (void)clockwise;
@@ -1409,7 +1451,15 @@ private:
 
         display_ = new CustomLcdDisplay(panel_io_, panel_,
             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
-        
+
+        // SpiLcdDisplay ctor fills white before LVGL; overwrite with black while backlight is off.
+        {
+            std::vector<uint16_t> black_row(DISPLAY_WIDTH, 0x0000);
+            for (int y = 0; y < DISPLAY_HEIGHT; y++) {
+                esp_lcd_panel_draw_bitmap(panel_, 0, y, DISPLAY_WIDTH, y + 1, black_row.data());
+            }
+        }
+
         // 使每次刷新的起始列数索引是4的倍数且列数总数是4的倍数，以满足SPD2010的要求
         lv_display_add_event_cb(lv_display_get_default(), [](lv_event_t *e) {
             lv_area_t *area = (lv_area_t *)lv_event_get_param(e);
@@ -1637,7 +1687,9 @@ public:
         InitializeButton();
         InitializeKnob();
         Initializespd2010Display();
-        GetBacklight()->RestoreBrightness();  // 对于不带摄像头的版本，InitializeCamera需要3s, 所以先恢复背光亮度
+        // Keep backlight OFF until CustomLcdDisplay::SetupUI shows the V4 boot screen.
+        // (Previously RestoreBrightness ran here and flashed the white pre-LVGL fill.)
+        GetBacklight()->SetBrightness(0);
         InitializeCamera();
     }
 
