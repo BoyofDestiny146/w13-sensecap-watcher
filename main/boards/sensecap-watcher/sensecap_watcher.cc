@@ -4,12 +4,14 @@
 #include "sensecap_audio_codec.h"
 #include "display/lcd_display.h"
 #include "application.h"
+#include "device_state.h"
 #include "knob.h"
 #include "config.h"
 #include "led/single_led.h"
 #include "power_save_timer.h"
 #include "sscma_camera.h"
 #include "lvgl_theme.h"
+#include "nexus_wifi_qr.h"
 
 #include <esp_log.h>
 #include <esp_check.h>
@@ -29,238 +31,121 @@
 #include <nvs_flash.h>
 #include <esp_app_desc.h>
 
+#include <cctype>
+#include <ctime>
+#include <cstring>
+#include <material_symbols.h>
+
 #include "assets/lang_config.h"
 
 #define TAG "sensecap_watcher"
 
 class CustomLcdDisplay : public SpiLcdDisplay {
     private:
-        lv_obj_t* w13_layer_ = nullptr;
-        lv_obj_t* perimeter_ring_ = nullptr;
-        lv_obj_t* perimeter_trail_ = nullptr;
-        lv_obj_t* w13_logo_ = nullptr;
-        lv_obj_t* w13_state_ = nullptr;
+        enum class V4Screen {
+            Boot,
+            ProvisionQr,
+            WaitingWifi,
+            Binding,
+            ReadySplash,
+            Main,
+            Listening,
+            Speaking,
+        };
 
-        // W-13 Wi-Fi provisioning UI
-        lv_obj_t* wifi_title_ = nullptr;
-        lv_obj_t* wifi_ssid_ = nullptr;
-        lv_obj_t* wifi_url_ = nullptr;
+        lv_obj_t* v4_layer_ = nullptr;
+        lv_obj_t* perimeter_a_ = nullptr;
+        lv_obj_t* perimeter_b_ = nullptr;
 
-        // W-13 low-battery overlay (replaces stock white popup visuals)
-        lv_obj_t* low_bat_ring_ = nullptr;
-        lv_obj_t* low_bat_trail_ = nullptr;
+        // Shared content widgets
+        lv_obj_t* title_label_ = nullptr;
+        lv_obj_t* subtitle_label_ = nullptr;
+        lv_obj_t* body_label_ = nullptr;
+        lv_obj_t* icon_label_ = nullptr;
+        lv_obj_t* qr_image_ = nullptr;
 
-        esp_timer_handle_t intro_timer_ = nullptr;
-        bool intro_finished_ = false;
+        // Main / listening chrome
+        lv_obj_t* status_time_ = nullptr;
+        lv_obj_t* status_wifi_ = nullptr;
+        lv_obj_t* status_battery_ = nullptr;
+        lv_obj_t* nexus_logo_ = nullptr;
+        lv_obj_t* listening_label_ = nullptr;
+        lv_obj_t* icon_talk_ = nullptr;
+        lv_obj_t* icon_task_ = nullptr;
+        lv_obj_t* icon_reset_ = nullptr;
+
+        // Low-battery overlay perimeter
+        lv_obj_t* low_bat_a_ = nullptr;
+        lv_obj_t* low_bat_b_ = nullptr;
+
+        esp_timer_handle_t ready_timer_ = nullptr;
         bool panel_display_off_ = false;
-        bool showing_wifi_ = false;
-        bool showing_emotion_ = false;
-        std::string pending_wifi_message_;
+        bool binding_ui_shown_ = false;
+        bool ready_splash_active_ = false;
+        V4Screen screen_ = V4Screen::Boot;
 
-        static constexpr uint32_t kPerimeterColor = 0x18E7F2;
-        static constexpr uint32_t kPerimeterTrailColor = 0x0A6A78;
-        static constexpr int kPerimeterSize = 408;   // hug 412x412 rim
-        static constexpr int kPerimeterWidth = 6;
-        static constexpr uint32_t kRevolutionMs = 5000;  // 5s clockwise
+        static constexpr uint32_t kPerimeterColor = 0x7CFF14;  // lime green per V4
+        static constexpr int kPerimeterSize = 408;
+        static constexpr int kPerimeterWidth = 8;
+        static constexpr uint32_t kReadySplashUs = 4000000;  // 4 seconds
 
-        static void PerimeterRotate(void* obj, int32_t value) {
-            lv_arc_set_rotation(static_cast<lv_obj_t*>(obj), value);
+        static bool IsClockText(const char* status) {
+            return status != nullptr && strlen(status) == 5 && status[2] == ':' &&
+                   isdigit(static_cast<unsigned char>(status[0])) &&
+                   isdigit(static_cast<unsigned char>(status[1])) &&
+                   isdigit(static_cast<unsigned char>(status[3])) &&
+                   isdigit(static_cast<unsigned char>(status[4]));
         }
 
-        void StartPerimeterAnimation(lv_obj_t* ring) {
-            if (ring == nullptr) {
-                return;
-            }
-            lv_anim_t a;
-            lv_anim_init(&a);
-            lv_anim_set_var(&a, ring);
-            lv_anim_set_exec_cb(&a, PerimeterRotate);
-            lv_anim_set_values(&a, 270, 270 + 360);  // clockwise from top
-            lv_anim_set_duration(&a, kRevolutionMs);
-            lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-            lv_anim_set_path_cb(&a, lv_anim_path_linear);
-            lv_anim_start(&a);
-        }
-
-        // Bright leading arc + softer trailing arc for a comet-style perimeter.
-        void CreatePerimeterPair(lv_obj_t* parent, lv_obj_t** head, lv_obj_t** trail) {
-            auto make_arc = [&](int span_deg, uint32_t color, lv_opa_t opa) -> lv_obj_t* {
+        // Static lime-green split bands (gaps at 12 o'clock and 6 o'clock). Never animated.
+        void CreateStaticSplitPerimeter(lv_obj_t* parent, lv_obj_t** arc_a, lv_obj_t** arc_b) {
+            auto make_arc = [&](int start_deg, int end_deg) -> lv_obj_t* {
                 lv_obj_t* ring = lv_arc_create(parent);
                 lv_obj_set_size(ring, kPerimeterSize, kPerimeterSize);
                 lv_obj_center(ring);
                 lv_arc_set_bg_angles(ring, 0, 360);
-                lv_arc_set_angles(ring, 0, span_deg);
-                lv_arc_set_rotation(ring, 270);
+                lv_arc_set_angles(ring, start_deg, end_deg);
+                lv_arc_set_rotation(ring, 270);  // 0° at top
                 lv_obj_remove_style(ring, nullptr, LV_PART_KNOB);
+                lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
                 lv_obj_set_style_arc_width(ring, kPerimeterWidth, LV_PART_MAIN);
                 lv_obj_set_style_arc_opa(ring, LV_OPA_TRANSP, LV_PART_MAIN);
                 lv_obj_set_style_arc_width(ring, kPerimeterWidth, LV_PART_INDICATOR);
-                lv_obj_set_style_arc_color(ring, lv_color_hex(color), LV_PART_INDICATOR);
-                lv_obj_set_style_arc_opa(ring, opa, LV_PART_INDICATOR);
+                lv_obj_set_style_arc_color(ring, lv_color_hex(kPerimeterColor), LV_PART_INDICATOR);
+                lv_obj_set_style_arc_opa(ring, LV_OPA_COVER, LV_PART_INDICATOR);
                 lv_obj_set_style_arc_rounded(ring, true, LV_PART_INDICATOR);
                 return ring;
             };
-
-            *trail = make_arc(110, kPerimeterTrailColor, LV_OPA_50);
-            *head = make_arc(42, kPerimeterColor, LV_OPA_COVER);
-            StartPerimeterAnimation(*trail);
-            StartPerimeterAnimation(*head);
+            // Gaps ~8° at top and bottom.
+            *arc_a = make_arc(8, 172);
+            *arc_b = make_arc(188, 352);
         }
 
-        void SetW13State(const char* text) {
-            if (w13_state_ != nullptr) {
-                lv_label_set_text(w13_state_, text);
-            }
-        }
-
-        void HideWifiLabels() {
-            if (wifi_title_ != nullptr)
-                lv_obj_add_flag(wifi_title_, LV_OBJ_FLAG_HIDDEN);
-            if (wifi_ssid_ != nullptr)
-                lv_obj_add_flag(wifi_ssid_, LV_OBJ_FLAG_HIDDEN);
-            if (wifi_url_ != nullptr)
-                lv_obj_add_flag(wifi_url_, LV_OBJ_FLAG_HIDDEN);
-        }
-
-        void ShowEmotionFace() {
-            if (showing_wifi_) {
-                return;
-            }
-            showing_emotion_ = true;
-
-            if (w13_logo_ != nullptr)
-                lv_obj_add_flag(w13_logo_, LV_OBJ_FLAG_HIDDEN);
-            if (w13_state_ != nullptr)
-                lv_obj_add_flag(w13_state_, LV_OBJ_FLAG_HIDDEN);
-            HideWifiLabels();
-
-            // Keep black W-13 surface; face is a child centered inside the ring.
-            if (w13_layer_ != nullptr) {
-                lv_obj_set_style_bg_opa(w13_layer_, LV_OPA_COVER, 0);
-                lv_obj_set_style_bg_color(w13_layer_, lv_color_hex(0x000000), 0);
-                lv_obj_move_foreground(w13_layer_);
-            }
-
+        void HideAllContent() {
+            auto hide = [](lv_obj_t* o) {
+                if (o != nullptr) {
+                    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+                }
+            };
+            hide(title_label_);
+            hide(subtitle_label_);
+            hide(body_label_);
+            hide(icon_label_);
+            hide(qr_image_);
+            hide(status_time_);
+            hide(status_wifi_);
+            hide(status_battery_);
+            hide(nexus_logo_);
+            hide(listening_label_);
+            hide(icon_talk_);
+            hide(icon_task_);
+            hide(icon_reset_);
             if (emoji_box_ != nullptr) {
-                lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
-                // Under the perimeter arcs, above the black fill.
-                if (perimeter_trail_ != nullptr)
-                    lv_obj_move_foreground(perimeter_trail_);
-                if (perimeter_ring_ != nullptr)
-                    lv_obj_move_foreground(perimeter_ring_);
-            }
-        }
-
-        void ShowIdleBranding() {
-            showing_emotion_ = false;
-            showing_wifi_ = false;
-
-            if (emoji_box_ != nullptr)
                 lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
-
-            HideWifiLabels();
-
-            if (w13_logo_ != nullptr)
-                lv_obj_remove_flag(w13_logo_, LV_OBJ_FLAG_HIDDEN);
-            if (w13_state_ != nullptr) {
-                lv_label_set_text(w13_state_, "NEXUS");
-                lv_obj_remove_flag(w13_state_, LV_OBJ_FLAG_HIDDEN);
-            }
-
-            if (w13_layer_ != nullptr) {
-                lv_obj_set_style_bg_opa(w13_layer_, LV_OPA_COVER, 0);
-                lv_obj_set_style_bg_color(w13_layer_, lv_color_hex(0x000000), 0);
-                lv_obj_move_foreground(w13_layer_);
             }
         }
 
-        static void IntroTimerCallback(void* arg) {
-            auto self = static_cast<CustomLcdDisplay*>(arg);
-            self->intro_finished_ = true;
-
-            DisplayLockGuard lock(self);
-
-            if (!self->pending_wifi_message_.empty()) {
-                self->ShowWifiScreenFromMessage(
-                    self->pending_wifi_message_.c_str());
-            }
-        }
-
-        void ShowIntroScreen() {
-            ShowW13Home();
-            ShowIdleBranding();
-        }
-
-        void ShowWifiScreen(const char* ssid, const char* url) {
-            ShowW13Home();
-            showing_wifi_ = true;
-            showing_emotion_ = false;
-
-            if (emoji_box_ != nullptr)
-                lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
-
-            if (w13_logo_ != nullptr)
-                lv_obj_add_flag(w13_logo_, LV_OBJ_FLAG_HIDDEN);
-
-            if (w13_state_ != nullptr)
-                lv_obj_add_flag(w13_state_, LV_OBJ_FLAG_HIDDEN);
-
-            if (w13_layer_ != nullptr) {
-                lv_obj_set_style_bg_opa(w13_layer_, LV_OPA_COVER, 0);
-                lv_obj_set_style_bg_color(w13_layer_, lv_color_hex(0x000000), 0);
-            }
-
-            // Exact branding: WI-FI SETUP / Nexus-1984 / http://192.168.4.1
-            const char* show_ssid =
-                (ssid != nullptr && ssid[0] != '\0') ? ssid : "Nexus-1984";
-            const char* show_url =
-                (url != nullptr && url[0] != '\0') ? url : "http://192.168.4.1";
-
-            if (wifi_title_ != nullptr) {
-                lv_label_set_text(wifi_title_, "WI-FI SETUP");
-                lv_obj_remove_flag(wifi_title_, LV_OBJ_FLAG_HIDDEN);
-            }
-
-            if (wifi_ssid_ != nullptr) {
-                lv_label_set_text(wifi_ssid_, show_ssid);
-                lv_obj_remove_flag(wifi_ssid_, LV_OBJ_FLAG_HIDDEN);
-            }
-
-            if (wifi_url_ != nullptr) {
-                lv_label_set_text(wifi_url_, show_url);
-                lv_obj_remove_flag(wifi_url_, LV_OBJ_FLAG_HIDDEN);
-            }
-
-            if (w13_layer_ != nullptr)
-                lv_obj_move_foreground(w13_layer_);
-            if (perimeter_trail_ != nullptr)
-                lv_obj_move_foreground(perimeter_trail_);
-            if (perimeter_ring_ != nullptr)
-                lv_obj_move_foreground(perimeter_ring_);
-        }
-
-        void ShowWifiScreenFromMessage(const char* message) {
-            // Prefer exact Nexus branding on-screen regardless of message parsing.
-            (void)message;
-            ShowWifiScreen("Nexus-1984", "http://192.168.4.1");
-        }
-
-        void ShowStockUiForSetup() {
-            if (w13_layer_ != nullptr)
-                lv_obj_add_flag(w13_layer_, LV_OBJ_FLAG_HIDDEN);
-
-            if (container_ != nullptr)
-                lv_obj_remove_flag(container_, LV_OBJ_FLAG_HIDDEN);
-            if (top_bar_ != nullptr)
-                lv_obj_remove_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
-            if (status_bar_ != nullptr)
-                lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
-            if (bottom_bar_ != nullptr)
-                lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-        }
-
-        void ShowW13Home() {
+        void ShowV4Layer() {
             if (container_ != nullptr)
                 lv_obj_add_flag(container_, LV_OBJ_FLAG_HIDDEN);
             if (top_bar_ != nullptr)
@@ -269,24 +154,321 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
             if (bottom_bar_ != nullptr)
                 lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+            if (v4_layer_ != nullptr) {
+                lv_obj_remove_flag(v4_layer_, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_style_bg_color(v4_layer_, lv_color_hex(0x000000), 0);
+                lv_obj_set_style_bg_opa(v4_layer_, LV_OPA_COVER, 0);
+                lv_obj_move_foreground(v4_layer_);
+            }
+            if (perimeter_a_ != nullptr)
+                lv_obj_move_foreground(perimeter_a_);
+            if (perimeter_b_ != nullptr)
+                lv_obj_move_foreground(perimeter_b_);
+        }
 
-            if (w13_layer_ != nullptr) {
-                lv_obj_remove_flag(w13_layer_, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_move_foreground(w13_layer_);
+        void ShowSideIcons(bool talk_active) {
+            if (icon_talk_ != nullptr) {
+                lv_obj_set_style_text_opa(icon_talk_, talk_active ? LV_OPA_COVER : LV_OPA_40, 0);
+                lv_obj_remove_flag(icon_talk_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (icon_task_ != nullptr) {
+                // Phase 1: visually inactive
+                lv_obj_set_style_text_opa(icon_task_, LV_OPA_30, 0);
+                lv_obj_remove_flag(icon_task_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (icon_reset_ != nullptr) {
+                lv_obj_set_style_text_opa(icon_reset_, LV_OPA_30, 0);
+                lv_obj_remove_flag(icon_reset_, LV_OBJ_FLAG_HIDDEN);
             }
         }
 
-        void AssertW13LowBatteryStyle(const lv_font_t* text_font) {
+        void BringPerimeterFront() {
+            if (perimeter_a_ != nullptr)
+                lv_obj_move_foreground(perimeter_a_);
+            if (perimeter_b_ != nullptr)
+                lv_obj_move_foreground(perimeter_b_);
+        }
+
+        void ShowProvisionQrScreen() {
+            screen_ = V4Screen::ProvisionQr;
+            ready_splash_active_ = false;
+            ShowV4Layer();
+            HideAllContent();
+
+            if (title_label_ != nullptr) {
+                lv_label_set_text(title_label_, "CONNECT TO NEXUS");
+                lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_width(title_label_, LV_SIZE_CONTENT);
+                lv_label_set_long_mode(title_label_, LV_LABEL_LONG_CLIP);
+                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, -130);
+                lv_obj_remove_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (subtitle_label_ != nullptr) {
+                lv_label_set_text(subtitle_label_, "Scan to begin setup");
+                lv_obj_set_style_text_color(subtitle_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_align(subtitle_label_, LV_ALIGN_CENTER, 0, -100);
+                lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (qr_image_ != nullptr) {
+                lv_obj_align(qr_image_, LV_ALIGN_CENTER, 0, 20);
+                lv_obj_remove_flag(qr_image_, LV_OBJ_FLAG_HIDDEN);
+            }
+            BringPerimeterFront();
+        }
+
+        void ShowWaitingWifiScreen() {
+            screen_ = V4Screen::WaitingWifi;
+            ready_splash_active_ = false;
+            ShowV4Layer();
+            HideAllContent();
+
+            if (icon_label_ != nullptr) {
+                lv_label_set_text(icon_label_, MATERIAL_SYMBOLS_WIFI);
+                lv_obj_set_style_text_color(icon_label_, lv_color_hex(kPerimeterColor), 0);
+                lv_obj_align(icon_label_, LV_ALIGN_CENTER, 0, -50);
+                lv_obj_remove_flag(icon_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (title_label_ != nullptr) {
+                lv_label_set_text(title_label_, "Waiting for Wi-Fi");
+                lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, 10);
+                lv_obj_remove_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (subtitle_label_ != nullptr) {
+                lv_label_set_text(subtitle_label_, "Setup...");
+                lv_obj_set_style_text_color(subtitle_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_align(subtitle_label_, LV_ALIGN_CENTER, 0, 42);
+                lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            // Secondary local setup URL if captive portal does not auto-open.
+            if (body_label_ != nullptr) {
+                lv_label_set_text(body_label_, "http://192.168.4.1");
+                lv_obj_set_style_text_color(body_label_, lv_color_hex(kPerimeterColor), 0);
+                lv_obj_align(body_label_, LV_ALIGN_CENTER, 0, 80);
+                lv_obj_remove_flag(body_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            BringPerimeterFront();
+        }
+
+        void ShowBindingScreen(bool mark_real_binding = false) {
+            screen_ = V4Screen::Binding;
+            // Only mark real binding when ACTIVATION status arrives (not mere version check).
+            if (mark_real_binding) {
+                binding_ui_shown_ = true;
+            }
+            ready_splash_active_ = false;
+            ShowV4Layer();
+            HideAllContent();
+
+            if (icon_label_ != nullptr) {
+                lv_label_set_text(icon_label_, MATERIAL_SYMBOLS_WIFI);
+                lv_obj_set_style_text_color(icon_label_, lv_color_hex(kPerimeterColor), 0);
+                lv_obj_align(icon_label_, LV_ALIGN_CENTER, 0, -70);
+                lv_obj_remove_flag(icon_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (subtitle_label_ != nullptr) {
+                lv_label_set_text(subtitle_label_, "Wi-Fi Connected");
+                lv_obj_set_style_text_color(subtitle_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_align(subtitle_label_, LV_ALIGN_CENTER, 0, -30);
+                lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (title_label_ != nullptr) {
+                lv_label_set_text(title_label_, "Binding device to your account");
+                lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_width(title_label_, LV_HOR_RES * 0.7);
+                lv_obj_set_style_text_align(title_label_, LV_TEXT_ALIGN_CENTER, 0);
+                lv_label_set_long_mode(title_label_, LV_LABEL_LONG_WRAP);
+                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, 20);
+                lv_obj_remove_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            BringPerimeterFront();
+        }
+
+        static void ReadySplashTimerCallback(void* arg) {
+            auto self = static_cast<CustomLcdDisplay*>(arg);
+            DisplayLockGuard lock(self);
+            self->ready_splash_active_ = false;
+            self->ShowMainScreen();
+        }
+
+        void ShowReadySplashScreen() {
+            screen_ = V4Screen::ReadySplash;
+            ready_splash_active_ = true;
+            binding_ui_shown_ = false;
+            ShowV4Layer();
+            HideAllContent();
+
+            if (icon_label_ != nullptr) {
+                lv_label_set_text(icon_label_, MATERIAL_SYMBOLS_CHECK);
+                lv_obj_set_style_text_color(icon_label_, lv_color_hex(kPerimeterColor), 0);
+                lv_obj_align(icon_label_, LV_ALIGN_CENTER, 0, -36);
+                lv_obj_remove_flag(icon_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (title_label_ != nullptr) {
+                lv_label_set_text(title_label_, "Nexus is ready!");
+                lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_width(title_label_, LV_HOR_RES * 0.75);
+                lv_obj_set_style_text_align(title_label_, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, 20);
+                lv_obj_remove_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            BringPerimeterFront();
+
+            if (ready_timer_ != nullptr) {
+                esp_timer_stop(ready_timer_);
+                esp_timer_start_once(ready_timer_, kReadySplashUs);
+            }
+        }
+
+        void RefreshStatusRow() {
+            auto& board = Board::GetInstance();
+
+            if (status_time_ != nullptr) {
+                time_t now = time(nullptr);
+                struct tm* tm_now = localtime(&now);
+                if (tm_now != nullptr && tm_now->tm_year >= (2025 - 1900)) {
+                    char buf[8];
+                    strftime(buf, sizeof(buf), "%H:%M", tm_now);
+                    lv_label_set_text(status_time_, buf);
+                } else {
+                    lv_label_set_text(status_time_, "--:--");
+                }
+            }
+
+            if (status_wifi_ != nullptr) {
+                const char* icon = board.GetNetworkStateIcon();
+                lv_label_set_text(status_wifi_, icon != nullptr ? icon : MATERIAL_SYMBOLS_WIFI_OFF);
+            }
+
+            if (status_battery_ != nullptr) {
+                int level = 0;
+                bool charging = false;
+                bool discharging = false;
+                const char* icon = MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_FULL;
+                if (board.GetBatteryLevel(level, charging, discharging)) {
+                    if (charging) {
+                        icon = MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_BOLT;
+                    } else {
+                        const char* levels[] = {
+                            MATERIAL_SYMBOLS_BATTERY_ANDROID_0,
+                            MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_1,
+                            MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_2,
+                            MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_3,
+                            MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_4,
+                            MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_5,
+                            MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_6,
+                            MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_FULL,
+                        };
+                        int idx = level <= 0 ? 0
+                                             : (level >= 100 ? 7 : 1 + ((level - 1) * 6 / 99));
+                        icon = levels[idx];
+                    }
+                }
+                lv_label_set_text(status_battery_, icon);
+            }
+        }
+
+        void ShowMainScreen() {
+            screen_ = V4Screen::Main;
+            ready_splash_active_ = false;
+            ShowV4Layer();
+            HideAllContent();
+            RefreshStatusRow();
+
+            if (status_time_ != nullptr)
+                lv_obj_remove_flag(status_time_, LV_OBJ_FLAG_HIDDEN);
+            if (status_wifi_ != nullptr)
+                lv_obj_remove_flag(status_wifi_, LV_OBJ_FLAG_HIDDEN);
+            if (status_battery_ != nullptr)
+                lv_obj_remove_flag(status_battery_, LV_OBJ_FLAG_HIDDEN);
+
+            if (nexus_logo_ != nullptr) {
+                lv_label_set_text(nexus_logo_, "NEXUS");
+                lv_obj_remove_flag(nexus_logo_, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            ShowSideIcons(true);
+            BringPerimeterFront();
+        }
+
+        void ShowListeningScreen() {
+            screen_ = V4Screen::Listening;
+            ready_splash_active_ = false;
+            ShowV4Layer();
+            HideAllContent();
+
+            if (listening_label_ != nullptr) {
+                lv_label_set_text(listening_label_, "Listening");
+                lv_obj_remove_flag(listening_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            // Closest built-in yellow happy face.
+            SpiLcdDisplay::SetEmotion("happy");
+            if (emoji_box_ != nullptr) {
+                lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
+                lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            ShowSideIcons(true);
+            BringPerimeterFront();
+        }
+
+        void ShowSpeakingScreen() {
+            screen_ = V4Screen::Speaking;
+            ready_splash_active_ = false;
+            ShowV4Layer();
+            HideAllContent();
+
+            if (listening_label_ != nullptr) {
+                lv_label_set_text(listening_label_, "Speaking");
+                lv_obj_remove_flag(listening_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (emoji_box_ != nullptr) {
+                lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
+                lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+            }
+            ShowSideIcons(true);
+            BringPerimeterFront();
+        }
+
+        void RestoreV4ScreenForDeviceState() {
+            auto state = Application::GetInstance().GetDeviceState();
+            switch (state) {
+                case kDeviceStateWifiConfiguring:
+                    ShowProvisionQrScreen();
+                    break;
+                case kDeviceStateConnecting:
+                    ShowWaitingWifiScreen();
+                    break;
+                case kDeviceStateActivating:
+                    ShowBindingScreen(binding_ui_shown_);
+                    break;
+                case kDeviceStateListening:
+                    ShowListeningScreen();
+                    break;
+                case kDeviceStateSpeaking:
+                case kDeviceStateNotifying:
+                    ShowSpeakingScreen();
+                    break;
+                case kDeviceStateIdle:
+                default:
+                    if (ready_splash_active_) {
+                        ShowReadySplashScreen();
+                    } else {
+                        ShowMainScreen();
+                    }
+                    break;
+            }
+        }
+
+        void AssertV4LowBatteryStyle(const lv_font_t* text_font) {
             if (low_battery_popup_ == nullptr || low_battery_label_ == nullptr) {
                 return;
             }
-
-            // Parent LcdDisplay::SetTheme may overwrite popup bg to theme low_battery_color.
             lv_obj_set_style_bg_color(low_battery_popup_, lv_color_hex(0x000000), 0);
             lv_obj_set_style_bg_opa(low_battery_popup_, LV_OPA_COVER, 0);
             lv_obj_set_style_border_width(low_battery_popup_, 0, 0);
             lv_obj_set_style_radius(low_battery_popup_, 0, 0);
-
             lv_label_set_text(low_battery_label_, "BATTERY LOW");
             lv_obj_set_style_text_color(low_battery_label_, lv_color_hex(0xF01818), 0);
             if (text_font != nullptr) {
@@ -295,50 +477,48 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             lv_obj_set_style_text_letter_space(low_battery_label_, 3, 0);
             lv_obj_set_style_text_align(low_battery_label_, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_move_foreground(low_battery_label_);
+            if (low_bat_a_ != nullptr)
+                lv_obj_move_foreground(low_bat_a_);
+            if (low_bat_b_ != nullptr)
+                lv_obj_move_foreground(low_bat_b_);
         }
 
-        void RebindW13TextFonts(const lv_font_t* text_font) {
-            if (text_font == nullptr) {
-                return;
+        void RebindV4TextFonts(const lv_font_t* text_font, const lv_font_t* icon_font) {
+            if (text_font != nullptr) {
+                lv_obj_t* text_objs[] = {title_label_,  subtitle_label_, body_label_,
+                                         nexus_logo_,   listening_label_, status_time_,
+                                         low_battery_label_};
+                for (lv_obj_t* o : text_objs) {
+                    if (o != nullptr) {
+                        lv_obj_set_style_text_font(o, text_font, 0);
+                    }
+                }
             }
-            if (w13_logo_ != nullptr) {
-                lv_obj_set_style_text_font(w13_logo_, text_font, 0);
-            }
-            if (w13_state_ != nullptr) {
-                lv_obj_set_style_text_font(w13_state_, text_font, 0);
-            }
-            if (wifi_title_ != nullptr) {
-                lv_obj_set_style_text_font(wifi_title_, text_font, 0);
-            }
-            if (wifi_ssid_ != nullptr) {
-                lv_obj_set_style_text_font(wifi_ssid_, text_font, 0);
-            }
-            if (wifi_url_ != nullptr) {
-                lv_obj_set_style_text_font(wifi_url_, text_font, 0);
-            }
-            if (low_battery_label_ != nullptr) {
-                lv_obj_set_style_text_font(low_battery_label_, text_font, 0);
+            if (icon_font != nullptr) {
+                lv_obj_t* icon_objs[] = {icon_label_, status_wifi_, status_battery_,
+                                         icon_talk_,  icon_task_,   icon_reset_};
+                for (lv_obj_t* o : icon_objs) {
+                    if (o != nullptr) {
+                        lv_obj_set_style_text_font(o, icon_font, 0);
+                    }
+                }
             }
         }
 
-        void SetupW13LowBatteryUi(const lv_font_t* text_font) {
+        void SetupV4LowBatteryUi(const lv_font_t* text_font) {
             if (low_battery_popup_ == nullptr || low_battery_label_ == nullptr) {
                 return;
             }
-
-            // Full-screen black W-13 low-battery surface (no stock white popup).
             lv_obj_set_size(low_battery_popup_, LV_HOR_RES, LV_VER_RES);
             lv_obj_align(low_battery_popup_, LV_ALIGN_CENTER, 0, 0);
             lv_obj_set_style_pad_all(low_battery_popup_, 0, 0);
             lv_obj_clear_flag(low_battery_popup_, LV_OBJ_FLAG_SCROLLABLE);
             lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
-
-            CreatePerimeterPair(low_battery_popup_, &low_bat_ring_, &low_bat_trail_);
-
+            CreateStaticSplitPerimeter(low_battery_popup_, &low_bat_a_, &low_bat_b_);
             lv_obj_set_width(low_battery_label_, LV_HOR_RES * 0.8);
             lv_label_set_long_mode(low_battery_label_, LV_LABEL_LONG_WRAP);
             lv_obj_align(low_battery_label_, LV_ALIGN_CENTER, 0, 0);
-            AssertW13LowBatteryStyle(text_font);
+            AssertV4LowBatteryStyle(text_font);
         }
 
         void SetPanelDisplayOn(bool on) {
@@ -351,30 +531,30 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 return;
             }
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "esp_lcd_panel_disp_on_off(%s) failed: %s",
-                         on ? "on" : "off", esp_err_to_name(err));
+                ESP_LOGW(TAG, "esp_lcd_panel_disp_on_off(%s) failed: %s", on ? "on" : "off",
+                         esp_err_to_name(err));
                 return;
             }
             panel_display_off_ = !on;
         }
 
-    public:
-        CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle, 
-                        esp_lcd_panel_handle_t panel_handle,
-                        int width,
-                        int height,
-                        int offset_x,
-                        int offset_y,
-                        bool mirror_x,
-                        bool mirror_y,
-                        bool swap_xy) 
-            : SpiLcdDisplay(io_handle, panel_handle, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
-            // Note: UI customization should be done in SetupUI(), not in constructor
-            // to ensure lvgl objects are created before accessing them
+        lv_obj_t* MakeLabel(lv_obj_t* parent, const lv_font_t* font, uint32_t color) {
+            lv_obj_t* label = lv_label_create(parent);
+            lv_obj_set_style_text_font(label, font, 0);
+            lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+            return label;
         }
 
+    public:
+        CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle, esp_lcd_panel_handle_t panel_handle,
+                         int width, int height, int offset_x, int offset_y, bool mirror_x,
+                         bool mirror_y, bool swap_xy)
+            : SpiLcdDisplay(io_handle, panel_handle, width, height, offset_x, offset_y, mirror_x,
+                            mirror_y, swap_xy) {}
+
         virtual void SetupUI() override {
-            // Call parent SetupUI() first to create all lvgl objects
             SpiLcdDisplay::SetupUI();
 
             DisplayLockGuard lock(this);
@@ -382,68 +562,33 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             auto text_font = lvgl_theme->text_font()->font();
             auto icon_font = lvgl_theme->icon_font()->font();
 
+            // Keep stock bar geometry for any fallback paths, but hide chrome.
             lv_obj_set_size(top_bar_, LV_HOR_RES, text_font->line_height);
             lv_obj_set_style_layout(top_bar_, LV_LAYOUT_NONE, 0);
-            lv_obj_set_style_pad_top(top_bar_, 10, 0);
-            lv_obj_set_style_pad_bottom(top_bar_, 1, 0);
-
             lv_obj_set_size(status_bar_, LV_HOR_RES, text_font->line_height);
             lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);
-            lv_obj_set_style_pad_top(status_bar_, 10, 0);
-            lv_obj_set_style_pad_bottom(status_bar_, 1, 0);
             lv_obj_set_y(status_bar_, text_font->line_height);
             lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_IGNORE_LAYOUT);
-
-            // Reparent mute and battery labels to top_bar_ to allow absolute positioning
             lv_obj_set_parent(mute_label_, top_bar_);
             lv_obj_set_parent(battery_label_, top_bar_);
-            lv_obj_set_style_margin_left(battery_label_, 0, 0);
-
-            // 针对圆形屏幕调整位置
-            //      network  mute  battery     //
-            //               status            //
-            lv_obj_align(network_label_, LV_ALIGN_TOP_MID, -1.5 * icon_font->line_height, 0);
-            lv_obj_align(mute_label_, LV_ALIGN_TOP_MID, 1.0 * icon_font->line_height, 0);
-            lv_obj_align(battery_label_, LV_ALIGN_TOP_MID, 2.5 * icon_font->line_height, 0);
-            
-            lv_obj_align(status_label_, LV_ALIGN_BOTTOM_MID, 0, 0);
-            lv_obj_set_flex_grow(status_label_, 0);
-            lv_obj_set_width(status_label_, LV_HOR_RES * 0.75);
-            lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
-
-            lv_obj_align(notification_label_, LV_ALIGN_BOTTOM_MID, 0, 0);
-            lv_obj_set_width(notification_label_, LV_HOR_RES * 0.75);
-            lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
-
-            // 针对圆形屏幕调整底部对话框位置，避免被圆角遮挡
             lv_obj_set_style_pad_bottom(bottom_bar_, 30, 0);
-            lv_obj_set_width(chat_message_label_, LV_HOR_RES * 0.75); // 限制宽度，避免文字贴边
+            lv_obj_set_width(chat_message_label_, LV_HOR_RES * 0.75);
 
-            // =========================================================
-            // Warehouse 13 / Nexus animated Watcher interface
-            // =========================================================
-
-            // W-13 is a full-screen overlay on the ROOT LVGL screen.
-            // Do not attach it to content_; the stock Watcher UI uses
-            // separate screen-level top/status/bottom layers.
             lv_obj_t* screen = lv_screen_active();
+            v4_layer_ = lv_obj_create(screen);
+            lv_obj_remove_style_all(v4_layer_);
+            lv_obj_set_pos(v4_layer_, 0, 0);
+            lv_obj_set_size(v4_layer_, LV_HOR_RES, LV_VER_RES);
+            lv_obj_set_style_bg_color(v4_layer_, lv_color_hex(0x000000), 0);
+            lv_obj_set_style_bg_opa(v4_layer_, LV_OPA_COVER, 0);
+            lv_obj_clear_flag(v4_layer_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_move_foreground(v4_layer_);
 
-            w13_layer_ = lv_obj_create(screen);
-            lv_obj_remove_style_all(w13_layer_);
-            lv_obj_set_pos(w13_layer_, 0, 0);
-            lv_obj_set_size(w13_layer_, LV_HOR_RES, LV_VER_RES);
-            lv_obj_move_foreground(w13_layer_);
-            lv_obj_set_style_bg_color(w13_layer_, lv_color_hex(0x000000), 0);
-            lv_obj_set_style_bg_opa(w13_layer_, LV_OPA_COVER, 0);
-            lv_obj_clear_flag(w13_layer_, LV_OBJ_FLAG_SCROLLABLE);
-
-            // Hide the normal XiaoZhi Watcher chrome. Reparent emoji_box_ into
-            // the W-13 layer so emotion faces sit centered inside the perimeter.
             if (container_ != nullptr)
                 lv_obj_add_flag(container_, LV_OBJ_FLAG_HIDDEN);
             if (emoji_box_ != nullptr) {
-                lv_obj_set_parent(emoji_box_, w13_layer_);
-                lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
+                lv_obj_set_parent(emoji_box_, v4_layer_);
+                lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
                 lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
             }
             if (top_bar_ != nullptr)
@@ -453,216 +598,217 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             if (bottom_bar_ != nullptr)
                 lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
 
-            lv_obj_move_foreground(w13_layer_);
+            CreateStaticSplitPerimeter(v4_layer_, &perimeter_a_, &perimeter_b_);
 
-            // Single perimeter comet (bright head + soft trail), ~5s CW.
-            CreatePerimeterPair(w13_layer_, &perimeter_ring_, &perimeter_trail_);
+            title_label_ = MakeLabel(v4_layer_, text_font, 0xFFFFFF);
+            subtitle_label_ = MakeLabel(v4_layer_, text_font, 0xFFFFFF);
+            body_label_ = MakeLabel(v4_layer_, text_font, kPerimeterColor);
+            icon_label_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
 
-            // W-13 center mark (readable, no extreme transform scaling)
-            w13_logo_ = lv_label_create(w13_layer_);
-            lv_label_set_text(w13_logo_, "W-13");
-            lv_obj_set_style_text_color(w13_logo_, lv_color_hex(0xF01818), 0);
-            lv_obj_set_style_text_font(w13_logo_, text_font, 0);
-            lv_obj_set_style_text_letter_space(w13_logo_, 6, 0);
-            lv_obj_align(w13_logo_, LV_ALIGN_CENTER, 0, -10);
+            qr_image_ = lv_image_create(v4_layer_);
+            lv_image_set_src(qr_image_, &nexus_wifi_qr);
+            lv_obj_add_flag(qr_image_, LV_OBJ_FLAG_HIDDEN);
 
-            // State caption
-            w13_state_ = lv_label_create(w13_layer_);
-            lv_label_set_text(w13_state_, "NEXUS");
-            lv_obj_set_style_text_color(w13_state_, lv_color_hex(0x8EFAFF), 0);
-            lv_obj_set_style_text_font(w13_state_, text_font, 0);
-            lv_obj_set_style_text_letter_space(w13_state_, 4, 0);
-            lv_obj_align(w13_state_, LV_ALIGN_CENTER, 0, 28);
+            status_time_ = MakeLabel(v4_layer_, text_font, 0xFFFFFF);
+            lv_obj_align(status_time_, LV_ALIGN_TOP_LEFT, 70, 48);
+            status_wifi_ = MakeLabel(v4_layer_, icon_font, 0xFFFFFF);
+            lv_obj_align(status_wifi_, LV_ALIGN_TOP_LEFT, 140, 50);
+            status_battery_ = MakeLabel(v4_layer_, icon_font, 0xFFFFFF);
+            lv_obj_align(status_battery_, LV_ALIGN_TOP_LEFT, 175, 50);
 
-            // Custom W-13 Wi-Fi provisioning screen (dark + cyan)
-            wifi_title_ = lv_label_create(w13_layer_);
-            lv_label_set_text(wifi_title_, "WI-FI SETUP");
-            lv_obj_set_style_text_color(wifi_title_, lv_color_hex(0x7CFAFF), 0);
-            lv_obj_set_style_text_font(wifi_title_, text_font, 0);
-            lv_obj_set_style_text_letter_space(wifi_title_, 3, 0);
-            lv_obj_align(wifi_title_, LV_ALIGN_CENTER, 0, -48);
-            lv_obj_add_flag(wifi_title_, LV_OBJ_FLAG_HIDDEN);
+            nexus_logo_ = MakeLabel(v4_layer_, text_font, 0xFFFFFF);
+            lv_label_set_text(nexus_logo_, "NEXUS");
+            lv_obj_set_style_text_letter_space(nexus_logo_, 4, 0);
+            lv_obj_align(nexus_logo_, LV_ALIGN_CENTER, -30, 0);
 
-            wifi_ssid_ = lv_label_create(w13_layer_);
-            lv_label_set_text(wifi_ssid_, "Nexus-1984");
-            lv_obj_set_width(wifi_ssid_, 300);
-            lv_obj_set_style_text_color(wifi_ssid_, lv_color_hex(0x18E7F2), 0);
-            lv_obj_set_style_text_font(wifi_ssid_, text_font, 0);
-            lv_obj_set_style_text_align(wifi_ssid_, LV_TEXT_ALIGN_CENTER, 0);
-            lv_obj_set_style_text_letter_space(wifi_ssid_, 2, 0);
-            lv_obj_align(wifi_ssid_, LV_ALIGN_CENTER, 0, 0);
-            lv_obj_add_flag(wifi_ssid_, LV_OBJ_FLAG_HIDDEN);
+            listening_label_ = MakeLabel(v4_layer_, text_font, 0xFFB300);
+            lv_obj_align(listening_label_, LV_ALIGN_CENTER, -30, -90);
 
-            wifi_url_ = lv_label_create(w13_layer_);
-            lv_label_set_text(wifi_url_, "http://192.168.4.1");
-            lv_obj_set_width(wifi_url_, 320);
-            lv_obj_set_style_text_color(wifi_url_, lv_color_hex(0xA8FFFF), 0);
-            lv_obj_set_style_text_font(wifi_url_, text_font, 0);
-            lv_obj_set_style_text_align(wifi_url_, LV_TEXT_ALIGN_CENTER, 0);
-            lv_label_set_long_mode(wifi_url_, LV_LABEL_LONG_WRAP);
-            lv_obj_align(wifi_url_, LV_ALIGN_CENTER, 0, 40);
-            lv_obj_add_flag(wifi_url_, LV_OBJ_FLAG_HIDDEN);
+            // Right-side Talk / Task / Reset — Talk active, others visually inactive (no touch).
+            icon_talk_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
+            lv_label_set_text(icon_talk_, MATERIAL_SYMBOLS_CHAT_BUBBLE);
+            lv_obj_align(icon_talk_, LV_ALIGN_RIGHT_MID, -48, -70);
 
-            SetupW13LowBatteryUi(text_font);
+            icon_task_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
+            lv_label_set_text(icon_task_, MATERIAL_SYMBOLS_CALENDAR_MONTH);
+            lv_obj_align(icon_task_, LV_ALIGN_RIGHT_MID, -48, 0);
 
-            // Start with branded W-13/NEXUS introduction.
-            ShowIntroScreen();
+            icon_reset_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
+            lv_label_set_text(icon_reset_, MATERIAL_SYMBOLS_REFRESH);
+            lv_obj_align(icon_reset_, LV_ALIGN_RIGHT_MID, -48, 70);
 
-            esp_timer_create_args_t intro_args = {};
-            intro_args.callback = IntroTimerCallback;
-            intro_args.arg = this;
-            intro_args.dispatch_method = ESP_TIMER_TASK;
-            intro_args.name = "w13_intro";
-            ESP_ERROR_CHECK(esp_timer_create(&intro_args, &intro_timer_));
-            ESP_ERROR_CHECK(esp_timer_start_once(intro_timer_, 6000000));
+            SetupV4LowBatteryUi(text_font);
+
+            esp_timer_create_args_t ready_args = {};
+            ready_args.callback = ReadySplashTimerCallback;
+            ready_args.arg = this;
+            ready_args.dispatch_method = ESP_TIMER_TASK;
+            ready_args.name = "v4_ready";
+            ESP_ERROR_CHECK(esp_timer_create(&ready_args, &ready_timer_));
+
+            // Boot: show main-style branding until real state events arrive.
+            ShowMainScreen();
         }
 
-        // Rebind W-13 label fonts after Assets::Apply / SetTextFont theme refresh
-        // so raw LVGL font pointers are not left dangling when previous owners reset.
+        // Rebind fonts after Assets::Apply / SetTextFont theme refresh (preserve lifetime fix).
         virtual void SetTheme(Theme* theme) override {
             LcdDisplay::SetTheme(theme);
-
             DisplayLockGuard lock(this);
             auto lvgl_theme = static_cast<LvglTheme*>(theme);
             if (lvgl_theme == nullptr || lvgl_theme->text_font() == nullptr) {
                 return;
             }
-
             const lv_font_t* text_font = lvgl_theme->text_font()->font();
-            RebindW13TextFonts(text_font);
-            AssertW13LowBatteryStyle(text_font);
+            const lv_font_t* icon_font =
+                lvgl_theme->icon_font() != nullptr ? lvgl_theme->icon_font()->font() : nullptr;
+            RebindV4TextFonts(text_font, icon_font);
+            AssertV4LowBatteryStyle(text_font);
         }
 
-        // Screen-off listening: keep W-13 UI; do not fall back to stock sleepy emotion.
+        // Screen-off + listening: blank panel; on wake restore correct V4 screen.
         virtual void SetPowerSaveMode(bool on) override {
             DisplayLockGuard lock(this);
             if (on) {
                 SetPanelDisplayOn(false);
-                ShowW13Home();
-                if (!showing_wifi_) {
-                    ShowIdleBranding();
-                    SetW13State("STANDBY");
-                }
+                ShowV4Layer();
             } else {
                 SetPanelDisplayOn(true);
-                ShowW13Home();
-                if (showing_wifi_) {
-                    if (w13_layer_ != nullptr) {
-                        lv_obj_move_foreground(w13_layer_);
-                    }
-                } else if (!showing_emotion_) {
-                    ShowIdleBranding();
-                }
+                RestoreV4ScreenForDeviceState();
             }
         }
 
         virtual void UpdateStatusBar(bool update_all = false) override {
+            // Drive low-battery popup via parent, then refresh V4 status row.
             LvglDisplay::UpdateStatusBar(update_all);
             DisplayLockGuard lock(this);
+            if (screen_ == V4Screen::Main || screen_ == V4Screen::Listening ||
+                screen_ == V4Screen::Speaking) {
+                RefreshStatusRow();
+            }
             if (low_battery_popup_ != nullptr &&
                 !lv_obj_has_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN)) {
-                // Keep W-13 low-battery overlay above home layer when active.
                 lv_obj_move_foreground(low_battery_popup_);
+                AssertV4LowBatteryStyle(nullptr);
             }
         }
 
         virtual void SetStatus(const char* status) override {
             SpiLcdDisplay::SetStatus(status);
-
             if (status == nullptr) {
                 return;
             }
 
             DisplayLockGuard lock(this);
 
-            // Never show stock white UI for Wi-Fi setup.
-            // Keep W-13 intro up until 6-second timer completes.
+            // Parent clock path writes HH:MM into SetStatus while idle — only update time tile.
+            if (IsClockText(status)) {
+                if (status_time_ != nullptr) {
+                    lv_label_set_text(status_time_, status);
+                }
+                return;
+            }
+
             if (strcmp(status, Lang::Strings::WIFI_CONFIG_MODE) == 0 ||
                 strcmp(status, Lang::Strings::ENTERING_WIFI_CONFIG_MODE) == 0) {
+                ShowProvisionQrScreen();
+                return;
+            }
 
-                if (!intro_finished_) {
-                    ShowIntroScreen();
+            // CONNECTING is also used when opening a chat channel — only treat it as
+            // Wi-Fi setup wait when we are already in the provisioning flow.
+            if (strcmp(status, Lang::Strings::CONNECTING) == 0) {
+                if (screen_ == V4Screen::ProvisionQr || screen_ == V4Screen::WaitingWifi) {
+                    ShowWaitingWifiScreen();
                 }
                 return;
             }
 
-            if (showing_wifi_) {
+            if (strcmp(status, Lang::Strings::ACTIVATION) == 0) {
+                ShowBindingScreen(true);
                 return;
             }
 
-            ShowW13Home();
+            // Post-Wi-Fi OTA check during first-time setup → binding visuals.
+            // Do not map routine reboot version checks or LOADING_PROTOCOL here.
+            if (strcmp(status, Lang::Strings::CHECKING_NEW_VERSION) == 0) {
+                if (screen_ == V4Screen::ProvisionQr || screen_ == V4Screen::WaitingWifi ||
+                    screen_ == V4Screen::Binding) {
+                    ShowBindingScreen(false);
+                }
+                return;
+            }
 
-            if (strcmp(status, Lang::Strings::LISTENING) == 0 ||
-                strcmp(status, Lang::Strings::SPEAKING) == 0) {
-                // Face lives inside the perimeter during active conversation.
-                ShowEmotionFace();
-            } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
-                ShowIdleBranding();
-            } else if (!showing_emotion_) {
-                ShowIdleBranding();
+            if (strcmp(status, Lang::Strings::LISTENING) == 0) {
+                ShowListeningScreen();
+                return;
+            }
+
+            if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
+                ShowSpeakingScreen();
+                return;
+            }
+
+            if (strcmp(status, Lang::Strings::STANDBY) == 0) {
+                if (binding_ui_shown_) {
+                    // Real activation/binding finished → ready splash, then main.
+                    ShowReadySplashScreen();
+                } else if (!ready_splash_active_) {
+                    ShowMainScreen();
+                }
+                return;
             }
         }
 
-        // Let emotion/assistant faces appear; idle returns to W-13 / NEXUS.
         virtual void SetEmotion(const char* emotion) override {
+            DisplayLockGuard lock(this);
+
+            if (emotion != nullptr && strcmp(emotion, "sleepy") == 0) {
+                // Screen-off path may request sleepy; keep current V4 screen under blank panel.
+                return;
+            }
+
+            if (screen_ == V4Screen::Listening) {
+                // V4 listening face is always happy; ignore app's neutral.
+                SpiLcdDisplay::SetEmotion("happy");
+                if (emoji_box_ != nullptr) {
+                    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
+                    lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+                }
+                BringPerimeterFront();
+                return;
+            }
+
             SpiLcdDisplay::SetEmotion(emotion);
 
-            DisplayLockGuard lock(this);
-            if (showing_wifi_) {
-                return;
-            }
-
-            const bool is_neutral =
-                emotion == nullptr || strcmp(emotion, "neutral") == 0;
-            const bool is_sleepy =
-                emotion != nullptr && strcmp(emotion, "sleepy") == 0;
-
-            if (is_sleepy) {
-                // Screen-off path may request sleepy; keep W-13 branding.
-                ShowIdleBranding();
-                return;
-            }
-
-            if (is_neutral) {
-                // Listening also sets neutral; keep face mode if already active.
-                if (showing_emotion_) {
-                    ShowEmotionFace();
-                } else {
-                    ShowIdleBranding();
+            if (screen_ == V4Screen::Speaking) {
+                if (emoji_box_ != nullptr) {
+                    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
+                    lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
                 }
+                BringPerimeterFront();
                 return;
             }
 
-            // Non-neutral emotions (thinking/speaking faces from protocol).
-            ShowEmotionFace();
+            if (screen_ == V4Screen::Main || screen_ == V4Screen::ReadySplash ||
+                screen_ == V4Screen::ProvisionQr || screen_ == V4Screen::WaitingWifi ||
+                screen_ == V4Screen::Binding) {
+                if (emoji_box_ != nullptr) {
+                    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
         }
 
-        virtual void SetChatMessage(
-            const char* role,
-            const char* content) override {
-
-            // Capture Wi-Fi provisioning message before stock UI renders it.
-            if (role != nullptr &&
-                content != nullptr &&
-                strcmp(role, "system") == 0 &&
+        virtual void SetChatMessage(const char* role, const char* content) override {
+            // Hotspot provisioning message → V4 QR screen (SoftAP path).
+            if (role != nullptr && content != nullptr && strcmp(role, "system") == 0 &&
                 strstr(content, "Hotspot: ") != nullptr) {
-
-                pending_wifi_message_ = content;
-
                 DisplayLockGuard lock(this);
-
-                if (intro_finished_) {
-                    ShowWifiScreenFromMessage(content);
-                } else {
-                    ShowIntroScreen();
-                }
-
+                ShowProvisionQrScreen();
                 return;
             }
 
-            // Suppress stock system text while W-13 UI is active.
-            if (role != nullptr &&
-                strcmp(role, "system") == 0) {
+            // Suppress stock system chat while V4 UI owns the screen.
+            if (role != nullptr && strcmp(role, "system") == 0) {
                 return;
             }
 
@@ -693,7 +839,7 @@ private:
             ESP_LOGI(TAG, "Enter screen-off listening mode");
             // Backlight first so the panel-off transition is not visible.
             GetBacklight()->SetBrightness(0);
-            // SetPowerSaveMode restores W-13 UI and blanks the panel when supported.
+            // SetPowerSaveMode blanks the panel; wake restores the current V4 screen.
             // Does not touch Wi-Fi, mic, wake-word, BSP_PWR_LCD, or BSP_PWR_CODEC_PA.
             GetDisplay()->SetPowerSaveMode(true);
         });
