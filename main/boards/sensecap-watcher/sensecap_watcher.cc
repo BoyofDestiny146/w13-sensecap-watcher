@@ -38,6 +38,8 @@
 
 #include "assets/lang_config.h"
 
+LV_FONT_DECLARE(font_noto_sans_basic_20_4);
+
 #define TAG "sensecap_watcher"
 
 // TEMPORARY: board-local V4 UI bench mode for visual validation of all 6 screens.
@@ -99,9 +101,15 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         static constexpr uint32_t kReadySplashUs = 4000000;  // 4 seconds
         // Side icons ~1.875x (LV_SCALE_NONE=256). Applied on MAIN + LISTENING only.
         static constexpr int32_t kSideIconScale = 480;
-        static constexpr int32_t kProvisionTitleScale = 420;     // ~1.64x vs main body text
-        static constexpr int32_t kProvisionSubtitleScale = 340;  // ~1.33x
-        static constexpr int32_t kProvisionQrScale = 360;        // ~1.41x → dominant center QR
+        // Screen 1 geometry for 412x412 circular panel (safe content ~65..347).
+        // Do NOT use transform_scale on Screen 1 text — it overflows the circle.
+        // Do NOT scale the I1 QR — LVGL cannot transform indexed images.
+        static constexpr int kProvisionTitleCenterY = 82;
+        static constexpr int kProvisionSubtitleCenterY = 120;
+        static constexpr int kProvisionQrX = 126;
+        static constexpr int kProvisionQrY = 155;
+        static constexpr int kProvisionTitleMaxW = 270;
+        static constexpr int kProvisionSubtitleMaxW = 250;
         static constexpr int kBenchScreenCount = 6;
 
         static bool IsClockText(const char* status) {
@@ -191,10 +199,30 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         }
 
         void ClearProvisionScales() {
+            // Restore shared labels after Screen 1 (no transform_scale; reset fonts/spacing).
             SetObjScale(title_label_, LV_SCALE_NONE);
             SetObjScale(subtitle_label_, LV_SCALE_NONE);
             if (qr_image_ != nullptr) {
                 lv_image_set_scale(qr_image_, LV_SCALE_NONE);
+            }
+            auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+            const lv_font_t* text_font =
+                (lvgl_theme != nullptr && lvgl_theme->text_font() != nullptr)
+                    ? lvgl_theme->text_font()->font()
+                    : nullptr;
+            if (title_label_ != nullptr) {
+                if (text_font != nullptr) {
+                    lv_obj_set_style_text_font(title_label_, text_font, 0);
+                }
+                lv_obj_set_style_text_letter_space(title_label_, 0, 0);
+                lv_obj_set_width(title_label_, LV_SIZE_CONTENT);
+            }
+            if (subtitle_label_ != nullptr) {
+                if (text_font != nullptr) {
+                    lv_obj_set_style_text_font(subtitle_label_, text_font, 0);
+                }
+                lv_obj_set_style_text_letter_space(subtitle_label_, 0, 0);
+                lv_obj_set_width(subtitle_label_, LV_SIZE_CONTENT);
             }
         }
 
@@ -244,31 +272,55 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ShowV4Layer();
             HideAllContent();
 
-            // Screen 1: only perimeter + large heading/subheading + dominant QR.
-            // No status row, no Talk/Task/Reset icons (HideAllContent already hid them).
+            // Screen 1: perimeter + heading + subtitle + QR inside circular safe area.
+            // No transform_scale on text. No image scale on I1 QR (unsupported by LVGL).
+            // Hierarchy: CONNECT TO NEXUS → Scan to begin setup → [QR].
+            constexpr int kDisplayCenter = 206;
+
             if (title_label_ != nullptr) {
                 lv_label_set_text(title_label_, "CONNECT TO NEXUS");
                 lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
-                lv_obj_set_width(title_label_, LV_SIZE_CONTENT);
+                // Board text font is Noto Sans 30 — fits ~26–30px target without scaling.
+                // Slight negative tracking keeps one line inside max width 270.
+                lv_obj_set_style_text_letter_space(title_label_, -2, 0);
                 lv_label_set_long_mode(title_label_, LV_LABEL_LONG_CLIP);
-                lv_obj_set_style_text_letter_space(title_label_, 2, 0);
-                SetObjScale(title_label_, kProvisionTitleScale);
-                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, -148);
+                lv_obj_set_width(title_label_, kProvisionTitleMaxW);
+                lv_obj_set_style_text_align(title_label_, LV_TEXT_ALIGN_CENTER, 0);
+                SetObjScale(title_label_, LV_SCALE_NONE);
+                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0,
+                             kProvisionTitleCenterY - kDisplayCenter);
                 lv_obj_remove_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(title_label_);
             }
             if (subtitle_label_ != nullptr) {
                 lv_label_set_text(subtitle_label_, "Scan to begin setup");
                 lv_obj_set_style_text_color(subtitle_label_, lv_color_hex(0xFFFFFF), 0);
-                lv_obj_set_style_text_letter_space(subtitle_label_, 1, 0);
-                SetObjScale(subtitle_label_, kProvisionSubtitleScale);
-                lv_obj_align(subtitle_label_, LV_ALIGN_CENTER, 0, -108);
+                // ~20px subtitle (within 18–22) via dedicated font — no transform_scale.
+                lv_obj_set_style_text_font(subtitle_label_, &font_noto_sans_basic_20_4, 0);
+                lv_obj_set_style_text_letter_space(subtitle_label_, 0, 0);
+                lv_label_set_long_mode(subtitle_label_, LV_LABEL_LONG_CLIP);
+                lv_obj_set_width(subtitle_label_, kProvisionSubtitleMaxW);
+                lv_obj_set_style_text_align(subtitle_label_, LV_TEXT_ALIGN_CENTER, 0);
+                SetObjScale(subtitle_label_, LV_SCALE_NONE);
+                lv_obj_align(subtitle_label_, LV_ALIGN_CENTER, 0,
+                             kProvisionSubtitleCenterY - kDisplayCenter);
                 lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(subtitle_label_);
             }
             if (qr_image_ != nullptr) {
-                lv_image_set_scale(qr_image_, kProvisionQrScale);
-                lv_obj_align(qr_image_, LV_ALIGN_CENTER, 0, 28);
+                // Re-assert source / visibility / opacity every show (bench cycles hide it).
+                lv_image_set_src(qr_image_, &nexus_wifi_qr);
+                lv_image_set_scale(qr_image_, LV_SCALE_NONE);  // I1 cannot be scaled
+                lv_image_set_antialias(qr_image_, false);      // hard pixel edges
+                lv_obj_set_style_opa(qr_image_, LV_OPA_COVER, 0);
+                lv_obj_set_style_image_opa(qr_image_, LV_OPA_COVER, 0);
+                lv_obj_set_style_image_recolor_opa(qr_image_, LV_OPA_TRANSP, 0);
+                // Native 165x165 ≈ target 160; top-left ≈ (126, 155), above black bg.
+                lv_obj_set_pos(qr_image_, kProvisionQrX, kProvisionQrY);
                 lv_obj_remove_flag(qr_image_, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(qr_image_);
             }
+            // Perimeter stays on top of content but does not cover the center QR.
             BringPerimeterFront();
         }
 
@@ -717,6 +769,12 @@ class CustomLcdDisplay : public SpiLcdDisplay {
 
             qr_image_ = lv_image_create(v4_layer_);
             lv_image_set_src(qr_image_, &nexus_wifi_qr);
+            lv_image_set_scale(qr_image_, LV_SCALE_NONE);
+            lv_image_set_antialias(qr_image_, false);
+            lv_obj_set_style_opa(qr_image_, LV_OPA_COVER, 0);
+            lv_obj_set_style_image_opa(qr_image_, LV_OPA_COVER, 0);
+            lv_obj_set_style_image_recolor_opa(qr_image_, LV_OPA_TRANSP, 0);
+            lv_obj_set_pos(qr_image_, kProvisionQrX, kProvisionQrY);
             lv_obj_add_flag(qr_image_, LV_OBJ_FLAG_HIDDEN);
 
             status_time_ = MakeLabel(v4_layer_, text_font, 0xFFFFFF);
