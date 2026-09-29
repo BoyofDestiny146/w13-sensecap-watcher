@@ -123,10 +123,10 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         static constexpr int kProvisionQrY = 155;
         static constexpr int kProvisionTitleMaxW = 270;
         static constexpr int kProvisionSubtitleMaxW = 250;
-        // Screen 3 Binding: ~4× visual vs 20px icon font → ~60 px (within 55–65).
-        static constexpr int32_t kBindingWifiScale = 512;  // 30px font × 2.0 = 60 px
-        static constexpr int kBindingWifiCenterX = 206;
-        static constexpr int kBindingWifiCenterY = 115;
+        // Screens 2+3 shared large Wi-Fi: ~60 px (within 55–65), center (206, 115).
+        static constexpr int32_t kLargeWifiScale = 512;  // 30px font × 2.0 = 60 px
+        static constexpr int kLargeWifiCenterX = 206;
+        static constexpr int kLargeWifiCenterY = 115;
         // Screen 4 Ready: vector check center + text.
         static constexpr int kReadyCheckCenterX = 206;
         static constexpr int kReadyCheckCenterY = 150;
@@ -294,6 +294,18 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             PlaceLabelAtCenter(obj, cx, cy, kSideIconScale);
         }
 
+        // Shared by Screen 2 (Waiting) and Screen 3 (Binding) so the icon cannot drift.
+        void ShowLargeWifiIcon() {
+            if (icon_label_ == nullptr) {
+                return;
+            }
+            lv_label_set_text(icon_label_, MATERIAL_SYMBOLS_WIFI);
+            lv_obj_set_style_text_font(icon_label_, &font_material_symbols_30_4, 0);
+            lv_obj_set_style_text_color(icon_label_, lv_color_hex(kPerimeterColor), 0);
+            PlaceLabelAtCenter(icon_label_, kLargeWifiCenterX, kLargeWifiCenterY, kLargeWifiScale);
+            lv_obj_remove_flag(icon_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+
         void ApplyMainStatusLayout() {
             // Upper circular arc: time left, Wi-Fi top-center, battery right — not a packed row.
             if (status_time_ != nullptr) {
@@ -418,12 +430,8 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ShowV4Layer();
             HideAllContent();
 
-            if (icon_label_ != nullptr) {
-                lv_label_set_text(icon_label_, MATERIAL_SYMBOLS_WIFI);
-                lv_obj_set_style_text_color(icon_label_, lv_color_hex(kPerimeterColor), 0);
-                lv_obj_align(icon_label_, LV_ALIGN_CENTER, 0, -50);
-                lv_obj_remove_flag(icon_label_, LV_OBJ_FLAG_HIDDEN);
-            }
+            // Same large Wi-Fi as Screen 3 — only text below differs.
+            ShowLargeWifiIcon();
             if (title_label_ != nullptr) {
                 lv_label_set_text(title_label_, "Waiting for Wi-Fi");
                 lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
@@ -459,15 +467,8 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ShowV4Layer();
             HideAllContent();
 
-            // Large Wi-Fi (~60 px) above existing text stack; text positions kept.
-            if (icon_label_ != nullptr) {
-                lv_label_set_text(icon_label_, MATERIAL_SYMBOLS_WIFI);
-                lv_obj_set_style_text_font(icon_label_, &font_material_symbols_30_4, 0);
-                lv_obj_set_style_text_color(icon_label_, lv_color_hex(kPerimeterColor), 0);
-                PlaceLabelAtCenter(icon_label_, kBindingWifiCenterX, kBindingWifiCenterY,
-                                   kBindingWifiScale);
-                lv_obj_remove_flag(icon_label_, LV_OBJ_FLAG_HIDDEN);
-            }
+            // Same large Wi-Fi as Screen 2 — only text below differs.
+            ShowLargeWifiIcon();
             if (subtitle_label_ != nullptr) {
                 lv_label_set_text(subtitle_label_, "Wi-Fi Connected");
                 lv_obj_set_style_text_color(subtitle_label_, lv_color_hex(0xFFFFFF), 0);
