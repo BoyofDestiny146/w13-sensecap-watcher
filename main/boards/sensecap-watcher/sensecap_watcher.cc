@@ -40,6 +40,13 @@
 
 #define TAG "sensecap_watcher"
 
+// TEMPORARY: board-local V4 UI bench mode for visual validation of all 6 screens.
+// Knob ROTATION cycles screens; knob CLICK still ToggleChatState / Talk.
+// Set to 0 before production / after bench photos. Does not touch NVS, Wi-Fi, OTA, or audio.
+#ifndef W13_V4_UI_BENCH_MODE
+#define W13_V4_UI_BENCH_MODE 1
+#endif
+
 class CustomLcdDisplay : public SpiLcdDisplay {
     private:
         enum class V4Screen {
@@ -83,11 +90,19 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         bool binding_ui_shown_ = false;
         bool ready_splash_active_ = false;
         V4Screen screen_ = V4Screen::Boot;
+        int bench_index_ = 0;
+        int64_t last_bench_cycle_us_ = 0;
 
         static constexpr uint32_t kPerimeterColor = 0x7CFF14;  // lime green per V4
         static constexpr int kPerimeterSize = 408;
         static constexpr int kPerimeterWidth = 8;
         static constexpr uint32_t kReadySplashUs = 4000000;  // 4 seconds
+        // Side icons ~1.875x (LV_SCALE_NONE=256). Applied on MAIN + LISTENING only.
+        static constexpr int32_t kSideIconScale = 480;
+        static constexpr int32_t kProvisionTitleScale = 420;     // ~1.64x vs main body text
+        static constexpr int32_t kProvisionSubtitleScale = 340;  // ~1.33x
+        static constexpr int32_t kProvisionQrScale = 360;        // ~1.41x → dominant center QR
+        static constexpr int kBenchScreenCount = 6;
 
         static bool IsClockText(const char* status) {
             return status != nullptr && strlen(status) == 5 && status[2] == ':' &&
@@ -166,7 +181,41 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lv_obj_move_foreground(perimeter_b_);
         }
 
+        void SetObjScale(lv_obj_t* obj, int32_t scale) {
+            if (obj == nullptr) {
+                return;
+            }
+            lv_obj_set_style_transform_pivot_x(obj, lv_pct(50), 0);
+            lv_obj_set_style_transform_pivot_y(obj, lv_pct(50), 0);
+            lv_obj_set_style_transform_scale(obj, scale, 0);
+        }
+
+        void ClearProvisionScales() {
+            SetObjScale(title_label_, LV_SCALE_NONE);
+            SetObjScale(subtitle_label_, LV_SCALE_NONE);
+            if (qr_image_ != nullptr) {
+                lv_image_set_scale(qr_image_, LV_SCALE_NONE);
+            }
+        }
+
+        void ApplySideIconLayout() {
+            // Larger icons with more vertical spacing so they do not collide.
+            if (icon_talk_ != nullptr) {
+                SetObjScale(icon_talk_, kSideIconScale);
+                lv_obj_align(icon_talk_, LV_ALIGN_RIGHT_MID, -40, -95);
+            }
+            if (icon_task_ != nullptr) {
+                SetObjScale(icon_task_, kSideIconScale);
+                lv_obj_align(icon_task_, LV_ALIGN_RIGHT_MID, -40, 0);
+            }
+            if (icon_reset_ != nullptr) {
+                SetObjScale(icon_reset_, kSideIconScale);
+                lv_obj_align(icon_reset_, LV_ALIGN_RIGHT_MID, -40, 95);
+            }
+        }
+
         void ShowSideIcons(bool talk_active) {
+            ApplySideIconLayout();
             if (icon_talk_ != nullptr) {
                 lv_obj_set_style_text_opa(icon_talk_, talk_active ? LV_OPA_COVER : LV_OPA_40, 0);
                 lv_obj_remove_flag(icon_talk_, LV_OBJ_FLAG_HIDDEN);
@@ -195,22 +244,29 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ShowV4Layer();
             HideAllContent();
 
+            // Screen 1: only perimeter + large heading/subheading + dominant QR.
+            // No status row, no Talk/Task/Reset icons (HideAllContent already hid them).
             if (title_label_ != nullptr) {
                 lv_label_set_text(title_label_, "CONNECT TO NEXUS");
                 lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
                 lv_obj_set_width(title_label_, LV_SIZE_CONTENT);
                 lv_label_set_long_mode(title_label_, LV_LABEL_LONG_CLIP);
-                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, -130);
+                lv_obj_set_style_text_letter_space(title_label_, 2, 0);
+                SetObjScale(title_label_, kProvisionTitleScale);
+                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, -148);
                 lv_obj_remove_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
             }
             if (subtitle_label_ != nullptr) {
                 lv_label_set_text(subtitle_label_, "Scan to begin setup");
                 lv_obj_set_style_text_color(subtitle_label_, lv_color_hex(0xFFFFFF), 0);
-                lv_obj_align(subtitle_label_, LV_ALIGN_CENTER, 0, -100);
+                lv_obj_set_style_text_letter_space(subtitle_label_, 1, 0);
+                SetObjScale(subtitle_label_, kProvisionSubtitleScale);
+                lv_obj_align(subtitle_label_, LV_ALIGN_CENTER, 0, -108);
                 lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
             }
             if (qr_image_ != nullptr) {
-                lv_obj_align(qr_image_, LV_ALIGN_CENTER, 0, 20);
+                lv_image_set_scale(qr_image_, kProvisionQrScale);
+                lv_obj_align(qr_image_, LV_ALIGN_CENTER, 0, 28);
                 lv_obj_remove_flag(qr_image_, LV_OBJ_FLAG_HIDDEN);
             }
             BringPerimeterFront();
@@ -219,6 +275,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         void ShowWaitingWifiScreen() {
             screen_ = V4Screen::WaitingWifi;
             ready_splash_active_ = false;
+            ClearProvisionScales();
             ShowV4Layer();
             HideAllContent();
 
@@ -231,6 +288,8 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             if (title_label_ != nullptr) {
                 lv_label_set_text(title_label_, "Waiting for Wi-Fi");
                 lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_width(title_label_, LV_SIZE_CONTENT);
+                lv_label_set_long_mode(title_label_, LV_LABEL_LONG_CLIP);
                 lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, 10);
                 lv_obj_remove_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
             }
@@ -257,6 +316,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 binding_ui_shown_ = true;
             }
             ready_splash_active_ = false;
+            ClearProvisionScales();
             ShowV4Layer();
             HideAllContent();
 
@@ -273,13 +333,19 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
             }
             if (title_label_ != nullptr) {
-                lv_label_set_text(title_label_, "Binding device to your account");
+                lv_label_set_text(title_label_, "Binding device to");
                 lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
-                lv_obj_set_width(title_label_, LV_HOR_RES * 0.7);
+                lv_obj_set_width(title_label_, LV_HOR_RES * 0.75);
                 lv_obj_set_style_text_align(title_label_, LV_TEXT_ALIGN_CENTER, 0);
-                lv_label_set_long_mode(title_label_, LV_LABEL_LONG_WRAP);
-                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, 20);
+                lv_label_set_long_mode(title_label_, LV_LABEL_LONG_CLIP);
+                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, 10);
                 lv_obj_remove_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (body_label_ != nullptr) {
+                lv_label_set_text(body_label_, "your account");
+                lv_obj_set_style_text_color(body_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_align(body_label_, LV_ALIGN_CENTER, 0, 48);
+                lv_obj_remove_flag(body_label_, LV_OBJ_FLAG_HIDDEN);
             }
             BringPerimeterFront();
         }
@@ -287,14 +353,23 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         static void ReadySplashTimerCallback(void* arg) {
             auto self = static_cast<CustomLcdDisplay*>(arg);
             DisplayLockGuard lock(self);
+#if W13_V4_UI_BENCH_MODE
+            // Bench mode keeps READY visible until knob cycles away.
+            (void)self;
+            return;
+#else
             self->ready_splash_active_ = false;
             self->ShowMainScreen();
+#endif
         }
 
         void ShowReadySplashScreen() {
             screen_ = V4Screen::ReadySplash;
             ready_splash_active_ = true;
+#if !W13_V4_UI_BENCH_MODE
             binding_ui_shown_ = false;
+#endif
+            ClearProvisionScales();
             ShowV4Layer();
             HideAllContent();
 
@@ -316,7 +391,9 @@ class CustomLcdDisplay : public SpiLcdDisplay {
 
             if (ready_timer_ != nullptr) {
                 esp_timer_stop(ready_timer_);
+#if !W13_V4_UI_BENCH_MODE
                 esp_timer_start_once(ready_timer_, kReadySplashUs);
+#endif
             }
         }
 
@@ -371,6 +448,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         void ShowMainScreen() {
             screen_ = V4Screen::Main;
             ready_splash_active_ = false;
+            ClearProvisionScales();
             ShowV4Layer();
             HideAllContent();
             RefreshStatusRow();
@@ -394,6 +472,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         void ShowListeningScreen() {
             screen_ = V4Screen::Listening;
             ready_splash_active_ = false;
+            ClearProvisionScales();
             ShowV4Layer();
             HideAllContent();
 
@@ -402,7 +481,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lv_obj_remove_flag(listening_label_, LV_OBJ_FLAG_HIDDEN);
             }
 
-            // Closest built-in yellow happy face.
+            // Closest built-in yellow happy face (approved — size/position unchanged).
             SpiLcdDisplay::SetEmotion("happy");
             if (emoji_box_ != nullptr) {
                 lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
@@ -416,6 +495,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         void ShowSpeakingScreen() {
             screen_ = V4Screen::Speaking;
             ready_splash_active_ = false;
+            ClearProvisionScales();
             ShowV4Layer();
             HideAllContent();
 
@@ -431,7 +511,37 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             BringPerimeterFront();
         }
 
+        void ShowBenchScreenIndex(int index) {
+            bench_index_ = ((index % kBenchScreenCount) + kBenchScreenCount) % kBenchScreenCount;
+            ESP_LOGI(TAG, "V4 bench screen %d/6", bench_index_ + 1);
+            switch (bench_index_) {
+                case 0:
+                    ShowProvisionQrScreen();
+                    break;
+                case 1:
+                    ShowWaitingWifiScreen();
+                    break;
+                case 2:
+                    ShowBindingScreen(false);
+                    break;
+                case 3:
+                    ShowReadySplashScreen();
+                    break;
+                case 4:
+                    ShowMainScreen();
+                    break;
+                case 5:
+                default:
+                    ShowListeningScreen();
+                    break;
+            }
+        }
+
         void RestoreV4ScreenForDeviceState() {
+#if W13_V4_UI_BENCH_MODE
+            ShowBenchScreenIndex(bench_index_);
+            return;
+#endif
             auto state = Application::GetInstance().GetDeviceState();
             switch (state) {
                 case kDeviceStateWifiConfiguring:
@@ -625,17 +735,16 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             lv_obj_align(listening_label_, LV_ALIGN_CENTER, -30, -90);
 
             // Right-side Talk / Task / Reset — Talk active, others visually inactive (no touch).
+            // Sized ~1.8–2.0x via ApplySideIconLayout() on MAIN/LISTENING.
             icon_talk_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
             lv_label_set_text(icon_talk_, MATERIAL_SYMBOLS_CHAT_BUBBLE);
-            lv_obj_align(icon_talk_, LV_ALIGN_RIGHT_MID, -48, -70);
 
             icon_task_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
             lv_label_set_text(icon_task_, MATERIAL_SYMBOLS_CALENDAR_MONTH);
-            lv_obj_align(icon_task_, LV_ALIGN_RIGHT_MID, -48, 0);
 
             icon_reset_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
             lv_label_set_text(icon_reset_, MATERIAL_SYMBOLS_REFRESH);
-            lv_obj_align(icon_reset_, LV_ALIGN_RIGHT_MID, -48, 70);
+            ApplySideIconLayout();
 
             SetupV4LowBatteryUi(text_font);
 
@@ -646,8 +755,36 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ready_args.name = "v4_ready";
             ESP_ERROR_CHECK(esp_timer_create(&ready_args, &ready_timer_));
 
+#if W13_V4_UI_BENCH_MODE
+            ESP_LOGW(TAG, "V4 UI BENCH MODE ON — knob rotate cycles 6 screens; click=Talk");
+            ShowBenchScreenIndex(0);
+#else
             // Boot: show main-style branding until real state events arrive.
             ShowMainScreen();
+#endif
+        }
+
+        // TEMPORARY bench API: knob rotation cycles the 6 V4 screens for photo validation.
+        void BenchCycleScreen(bool clockwise) {
+#if W13_V4_UI_BENCH_MODE
+            const int64_t now = esp_timer_get_time();
+            if (now - last_bench_cycle_us_ < 250000) {
+                return;
+            }
+            last_bench_cycle_us_ = now;
+            DisplayLockGuard lock(this);
+            ShowBenchScreenIndex(bench_index_ + (clockwise ? 1 : -1));
+#else
+            (void)clockwise;
+#endif
+        }
+
+        static constexpr bool IsBenchModeEnabled() {
+#if W13_V4_UI_BENCH_MODE
+            return true;
+#else
+            return false;
+#endif
         }
 
         // Rebind fonts after Assets::Apply / SetTextFont theme refresh (preserve lifetime fix).
@@ -702,11 +839,16 @@ class CustomLcdDisplay : public SpiLcdDisplay {
 
             // Parent clock path writes HH:MM into SetStatus while idle — only update time tile.
             if (IsClockText(status)) {
-                if (status_time_ != nullptr) {
+                if (status_time_ != nullptr && screen_ == V4Screen::Main) {
                     lv_label_set_text(status_time_, status);
                 }
                 return;
             }
+
+#if W13_V4_UI_BENCH_MODE
+            // Bench mode owns the visible screen; ignore automatic state navigation.
+            return;
+#endif
 
             if (strcmp(status, Lang::Strings::WIFI_CONFIG_MODE) == 0 ||
                 strcmp(status, Lang::Strings::ENTERING_WIFI_CONFIG_MODE) == 0) {
@@ -802,9 +944,13 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             // Hotspot provisioning message → V4 QR screen (SoftAP path).
             if (role != nullptr && content != nullptr && strcmp(role, "system") == 0 &&
                 strstr(content, "Hotspot: ") != nullptr) {
+#if W13_V4_UI_BENCH_MODE
+                return;
+#else
                 DisplayLockGuard lock(this);
                 ShowProvisionQrScreen();
                 return;
+#endif
             }
 
             // Suppress stock system chat while V4 UI owns the screen.
@@ -923,9 +1069,19 @@ private:
     }
 
     void OnKnobRotate(bool clockwise) {
+        power_save_timer_->WakeUp();
+
+#if W13_V4_UI_BENCH_MODE
+        // TEMPORARY: rotation cycles V4 bench screens (volume via knob paused in bench mode).
+        // Knob CLICK still runs ToggleChatState() for Talk.
+        // Display is always CustomLcdDisplay on this board (no RTTI required).
+        static_cast<CustomLcdDisplay*>(GetDisplay())->BenchCycleScreen(clockwise);
+        return;
+#endif
+
         auto codec = GetAudioCodec();
         int current_volume = codec->output_volume();
-        int new_volume = current_volume + (clockwise ? -5 : 5); 
+        int new_volume = current_volume + (clockwise ? -5 : 5);
 
         // 确保音量在有效范围内
         if (new_volume > 100) {
@@ -938,14 +1094,14 @@ private:
 
         codec->SetOutputVolume(new_volume);
         ESP_LOGI(TAG, "Volume changed from %d to %d", current_volume, new_volume);
-        
+
         // 显示通知前检查实际变化
         if (new_volume != codec->output_volume()) {
-            ESP_LOGE(TAG, "Failed to set volume! Expected:%d Actual:%d", 
-                   new_volume, codec->output_volume());
+            ESP_LOGE(TAG, "Failed to set volume! Expected:%d Actual:%d", new_volume,
+                     codec->output_volume());
         }
-        GetDisplay()->ShowNotification(std::string(Lang::Strings::VOLUME) + ": "+std::to_string(codec->output_volume()));
-        power_save_timer_->WakeUp();
+        GetDisplay()->ShowNotification(std::string(Lang::Strings::VOLUME) + ": " +
+                                       std::to_string(codec->output_volume()));
     }
 
     void InitializeKnob() {
