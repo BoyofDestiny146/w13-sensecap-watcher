@@ -81,7 +81,8 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         lv_obj_t* listening_label_ = nullptr;
         lv_obj_t* icon_talk_ = nullptr;
         lv_obj_t* icon_task_ = nullptr;
-        lv_obj_t* icon_reset_ = nullptr;
+        lv_obj_t* icon_volume_ = nullptr;
+        lv_obj_t* icon_wifi_ = nullptr;
 
         // Low-battery overlay perimeter
         lv_obj_t* low_bat_a_ = nullptr;
@@ -99,8 +100,17 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         static constexpr int kPerimeterSize = 408;
         static constexpr int kPerimeterWidth = 8;
         static constexpr uint32_t kReadySplashUs = 4000000;  // 4 seconds
-        // Side icons ~1.875x (LV_SCALE_NONE=256). Applied on MAIN + LISTENING only.
-        static constexpr int32_t kSideIconScale = 480;
+        // Side icons: prior bench size was 480/256 ≈ 1.875×; +20% → 576/256 = 2.25×.
+        // Applied on MAIN + LISTENING only. Centers follow the right circular arc.
+        static constexpr int32_t kSideIconScale = 576;  // 480 * 1.2
+        static constexpr int kSideIconTalkX = 326;
+        static constexpr int kSideIconTalkY = 115;
+        static constexpr int kSideIconTasksX = 346;
+        static constexpr int kSideIconTasksY = 175;
+        static constexpr int kSideIconVolumeX = 346;
+        static constexpr int kSideIconVolumeY = 237;
+        static constexpr int kSideIconWifiX = 326;
+        static constexpr int kSideIconWifiY = 299;
         // Screen 1 geometry for 412x412 circular panel (safe content ~65..347).
         // Do NOT use transform_scale on Screen 1 text — it overflows the circle.
         // Do NOT scale the I1 QR — LVGL cannot transform indexed images.
@@ -162,7 +172,8 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             hide(listening_label_);
             hide(icon_talk_);
             hide(icon_task_);
-            hide(icon_reset_);
+            hide(icon_volume_);
+            hide(icon_wifi_);
             if (emoji_box_ != nullptr) {
                 lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
             }
@@ -226,20 +237,24 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             }
         }
 
+        void PlaceSideIconAtCenter(lv_obj_t* obj, int cx, int cy) {
+            if (obj == nullptr) {
+                return;
+            }
+            // Pivot 50% keeps the visual center at the unscaled object center after scale.
+            SetObjScale(obj, kSideIconScale);
+            const lv_font_t* font = lv_obj_get_style_text_font(obj, LV_PART_MAIN);
+            const int32_t box = (font != nullptr && font->line_height > 0) ? font->line_height : 20;
+            lv_obj_set_pos(obj, cx - box / 2, cy - box / 2);
+        }
+
         void ApplySideIconLayout() {
-            // Larger icons with more vertical spacing so they do not collide.
-            if (icon_talk_ != nullptr) {
-                SetObjScale(icon_talk_, kSideIconScale);
-                lv_obj_align(icon_talk_, LV_ALIGN_RIGHT_MID, -40, -95);
-            }
-            if (icon_task_ != nullptr) {
-                SetObjScale(icon_task_, kSideIconScale);
-                lv_obj_align(icon_task_, LV_ALIGN_RIGHT_MID, -40, 0);
-            }
-            if (icon_reset_ != nullptr) {
-                SetObjScale(icon_reset_, kSideIconScale);
-                lv_obj_align(icon_reset_, LV_ALIGN_RIGHT_MID, -40, 95);
-            }
+            // Four controls along the right-hand circular arc (inward curve):
+            // Talk / Tasks / Volume / Change Wi-Fi — not a straight column.
+            PlaceSideIconAtCenter(icon_talk_, kSideIconTalkX, kSideIconTalkY);
+            PlaceSideIconAtCenter(icon_task_, kSideIconTasksX, kSideIconTasksY);
+            PlaceSideIconAtCenter(icon_volume_, kSideIconVolumeX, kSideIconVolumeY);
+            PlaceSideIconAtCenter(icon_wifi_, kSideIconWifiX, kSideIconWifiY);
         }
 
         void ShowSideIcons(bool talk_active) {
@@ -249,13 +264,19 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lv_obj_remove_flag(icon_talk_, LV_OBJ_FLAG_HIDDEN);
             }
             if (icon_task_ != nullptr) {
-                // Phase 1: visually inactive
+                // Visual placeholder only — no Tasks behavior yet.
                 lv_obj_set_style_text_opa(icon_task_, LV_OPA_30, 0);
                 lv_obj_remove_flag(icon_task_, LV_OBJ_FLAG_HIDDEN);
             }
-            if (icon_reset_ != nullptr) {
-                lv_obj_set_style_text_opa(icon_reset_, LV_OPA_30, 0);
-                lv_obj_remove_flag(icon_reset_, LV_OBJ_FLAG_HIDDEN);
+            if (icon_volume_ != nullptr) {
+                // Visual placeholder only — no Volume behavior yet.
+                lv_obj_set_style_text_opa(icon_volume_, LV_OPA_30, 0);
+                lv_obj_remove_flag(icon_volume_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (icon_wifi_ != nullptr) {
+                // Visual placeholder only — no Change Wi-Fi behavior yet.
+                lv_obj_set_style_text_opa(icon_wifi_, LV_OPA_30, 0);
+                lv_obj_remove_flag(icon_wifi_, LV_OBJ_FLAG_HIDDEN);
             }
         }
 
@@ -657,8 +678,9 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 }
             }
             if (icon_font != nullptr) {
-                lv_obj_t* icon_objs[] = {icon_label_, status_wifi_, status_battery_,
-                                         icon_talk_,  icon_task_,   icon_reset_};
+                lv_obj_t* icon_objs[] = {icon_label_,   status_wifi_, status_battery_,
+                                         icon_talk_,    icon_task_,   icon_volume_,
+                                         icon_wifi_};
                 for (lv_obj_t* o : icon_objs) {
                     if (o != nullptr) {
                         lv_obj_set_style_text_font(o, icon_font, 0);
@@ -792,16 +814,19 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             listening_label_ = MakeLabel(v4_layer_, text_font, 0xFFB300);
             lv_obj_align(listening_label_, LV_ALIGN_CENTER, -30, -90);
 
-            // Right-side Talk / Task / Reset — Talk active, others visually inactive (no touch).
-            // Sized ~1.8–2.0x via ApplySideIconLayout() on MAIN/LISTENING.
+            // Right-side arc controls (MAIN/LISTENING): Talk / Tasks / Volume / Change Wi-Fi.
+            // Talk active; others visual placeholders only (no touch / no new behavior).
             icon_talk_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
             lv_label_set_text(icon_talk_, MATERIAL_SYMBOLS_CHAT_BUBBLE);
 
             icon_task_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
             lv_label_set_text(icon_task_, MATERIAL_SYMBOLS_CALENDAR_MONTH);
 
-            icon_reset_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
-            lv_label_set_text(icon_reset_, MATERIAL_SYMBOLS_REFRESH);
+            icon_volume_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
+            lv_label_set_text(icon_volume_, MATERIAL_SYMBOLS_VOLUME_UP);
+
+            icon_wifi_ = MakeLabel(v4_layer_, icon_font, kPerimeterColor);
+            lv_label_set_text(icon_wifi_, MATERIAL_SYMBOLS_WIFI);
             ApplySideIconLayout();
 
             SetupV4LowBatteryUi(text_font);
