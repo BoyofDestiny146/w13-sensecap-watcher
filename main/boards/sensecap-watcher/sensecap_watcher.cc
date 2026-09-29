@@ -39,6 +39,7 @@
 #include "assets/lang_config.h"
 
 LV_FONT_DECLARE(font_noto_sans_basic_20_4);
+LV_FONT_DECLARE(font_material_symbols_30_4);
 
 #define TAG "sensecap_watcher"
 
@@ -83,6 +84,8 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         lv_obj_t* icon_task_ = nullptr;
         lv_obj_t* icon_volume_ = nullptr;
         lv_obj_t* icon_wifi_ = nullptr;
+        // Screen 4 ready check — LVGL line polyline (not a scaled font glyph).
+        lv_obj_t* ready_check_ = nullptr;
 
         // Low-battery overlay perimeter
         lv_obj_t* low_bat_a_ = nullptr;
@@ -120,6 +123,21 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         static constexpr int kProvisionQrY = 155;
         static constexpr int kProvisionTitleMaxW = 270;
         static constexpr int kProvisionSubtitleMaxW = 250;
+        // Screen 3 Binding: ~4× visual vs 20px icon font → ~60 px (within 55–65).
+        static constexpr int32_t kBindingWifiScale = 512;  // 30px font × 2.0 = 60 px
+        static constexpr int kBindingWifiCenterX = 206;
+        static constexpr int kBindingWifiCenterY = 115;
+        // Screen 4 Ready: vector check center + text.
+        static constexpr int kReadyCheckCenterX = 206;
+        static constexpr int kReadyCheckCenterY = 150;
+        static constexpr int kReadyTextCenterY = 215;
+        // Screen 5 MAIN status along upper circular arc (centers).
+        static constexpr int kStatusTimeX = 105;
+        static constexpr int kStatusTimeY = 78;
+        static constexpr int kStatusWifiX = 206;
+        static constexpr int kStatusWifiY = 72;
+        static constexpr int kStatusBatteryX = 280;
+        static constexpr int kStatusBatteryY = 78;
         static constexpr int kBenchScreenCount = 6;
 
         static bool IsClockText(const char* status) {
@@ -174,6 +192,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             hide(icon_task_);
             hide(icon_volume_);
             hide(icon_wifi_);
+            hide(ready_check_);
             if (emoji_box_ != nullptr) {
                 lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
             }
@@ -210,9 +229,10 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         }
 
         void ClearProvisionScales() {
-            // Restore shared labels after Screen 1 (no transform_scale; reset fonts/spacing).
+            // Restore shared labels after Screen 1 / splash icon scales.
             SetObjScale(title_label_, LV_SCALE_NONE);
             SetObjScale(subtitle_label_, LV_SCALE_NONE);
+            SetObjScale(icon_label_, LV_SCALE_NONE);
             if (qr_image_ != nullptr) {
                 lv_image_set_scale(qr_image_, LV_SCALE_NONE);
             }
@@ -220,6 +240,10 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             const lv_font_t* text_font =
                 (lvgl_theme != nullptr && lvgl_theme->text_font() != nullptr)
                     ? lvgl_theme->text_font()->font()
+                    : nullptr;
+            const lv_font_t* icon_font =
+                (lvgl_theme != nullptr && lvgl_theme->icon_font() != nullptr)
+                    ? lvgl_theme->icon_font()->font()
                     : nullptr;
             if (title_label_ != nullptr) {
                 if (text_font != nullptr) {
@@ -235,17 +259,59 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lv_obj_set_style_text_letter_space(subtitle_label_, 0, 0);
                 lv_obj_set_width(subtitle_label_, LV_SIZE_CONTENT);
             }
+            if (icon_label_ != nullptr && icon_font != nullptr) {
+                lv_obj_set_style_text_font(icon_label_, icon_font, 0);
+            }
+            if (ready_check_ != nullptr) {
+                lv_obj_add_flag(ready_check_, LV_OBJ_FLAG_HIDDEN);
+            }
         }
 
-        void PlaceSideIconAtCenter(lv_obj_t* obj, int cx, int cy) {
+        void PlaceLabelAtCenter(lv_obj_t* obj, int cx, int cy, int32_t scale) {
             if (obj == nullptr) {
                 return;
             }
             // Pivot 50% keeps the visual center at the unscaled object center after scale.
-            SetObjScale(obj, kSideIconScale);
+            SetObjScale(obj, scale);
             const lv_font_t* font = lv_obj_get_style_text_font(obj, LV_PART_MAIN);
-            const int32_t box = (font != nullptr && font->line_height > 0) ? font->line_height : 20;
-            lv_obj_set_pos(obj, cx - box / 2, cy - box / 2);
+            int32_t w = (font != nullptr && font->line_height > 0) ? font->line_height : 20;
+            int32_t h = w;
+            const char* txt = lv_label_get_text(obj);
+            if (txt != nullptr && font != nullptr && txt[0] != '\0') {
+                lv_point_t sz = {};
+                lv_text_get_size(&sz, txt, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+                if (sz.x > 0) {
+                    w = sz.x;
+                }
+                if (sz.y > 0) {
+                    h = sz.y;
+                }
+            }
+            lv_obj_set_pos(obj, cx - w / 2, cy - h / 2);
+        }
+
+        void PlaceSideIconAtCenter(lv_obj_t* obj, int cx, int cy) {
+            PlaceLabelAtCenter(obj, cx, cy, kSideIconScale);
+        }
+
+        void ApplyMainStatusLayout() {
+            // Upper circular arc: time left, Wi-Fi top-center, battery right — not a packed row.
+            if (status_time_ != nullptr) {
+                lv_obj_set_style_text_font(status_time_, &font_noto_sans_basic_20_4, 0);
+                lv_obj_set_style_text_color(status_time_, lv_color_hex(0xFFFFFF), 0);
+                // Closest built-in to ~22–24 px without transform_scale.
+                PlaceLabelAtCenter(status_time_, kStatusTimeX, kStatusTimeY, LV_SCALE_NONE);
+            }
+            if (status_wifi_ != nullptr) {
+                lv_obj_set_style_text_font(status_wifi_, &font_material_symbols_30_4, 0);
+                lv_obj_set_style_text_color(status_wifi_, lv_color_hex(0xFFFFFF), 0);
+                PlaceLabelAtCenter(status_wifi_, kStatusWifiX, kStatusWifiY, LV_SCALE_NONE);
+            }
+            if (status_battery_ != nullptr) {
+                lv_obj_set_style_text_font(status_battery_, &font_material_symbols_30_4, 0);
+                lv_obj_set_style_text_color(status_battery_, lv_color_hex(0xFFFFFF), 0);
+                PlaceLabelAtCenter(status_battery_, kStatusBatteryX, kStatusBatteryY, LV_SCALE_NONE);
+            }
         }
 
         void ApplySideIconLayout() {
@@ -393,10 +459,13 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ShowV4Layer();
             HideAllContent();
 
+            // Large Wi-Fi (~60 px) above existing text stack; text positions kept.
             if (icon_label_ != nullptr) {
                 lv_label_set_text(icon_label_, MATERIAL_SYMBOLS_WIFI);
+                lv_obj_set_style_text_font(icon_label_, &font_material_symbols_30_4, 0);
                 lv_obj_set_style_text_color(icon_label_, lv_color_hex(kPerimeterColor), 0);
-                lv_obj_align(icon_label_, LV_ALIGN_CENTER, 0, -70);
+                PlaceLabelAtCenter(icon_label_, kBindingWifiCenterX, kBindingWifiCenterY,
+                                   kBindingWifiScale);
                 lv_obj_remove_flag(icon_label_, LV_OBJ_FLAG_HIDDEN);
             }
             if (subtitle_label_ != nullptr) {
@@ -446,18 +515,20 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ShowV4Layer();
             HideAllContent();
 
+            // Large lime check via LVGL line polyline (~60 px) — not a scaled glyph.
             if (icon_label_ != nullptr) {
-                lv_label_set_text(icon_label_, MATERIAL_SYMBOLS_CHECK);
-                lv_obj_set_style_text_color(icon_label_, lv_color_hex(kPerimeterColor), 0);
-                lv_obj_align(icon_label_, LV_ALIGN_CENTER, 0, -36);
-                lv_obj_remove_flag(icon_label_, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(icon_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (ready_check_ != nullptr) {
+                lv_obj_remove_flag(ready_check_, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(ready_check_);
             }
             if (title_label_ != nullptr) {
                 lv_label_set_text(title_label_, "Nexus is ready!");
                 lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
                 lv_obj_set_width(title_label_, LV_HOR_RES * 0.75);
                 lv_obj_set_style_text_align(title_label_, LV_TEXT_ALIGN_CENTER, 0);
-                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, 20);
+                lv_obj_align(title_label_, LV_ALIGN_CENTER, 0, kReadyTextCenterY - 206);
                 lv_obj_remove_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
             }
             BringPerimeterFront();
@@ -525,6 +596,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ShowV4Layer();
             HideAllContent();
             RefreshStatusRow();
+            ApplyMainStatusLayout();
 
             if (status_time_ != nullptr)
                 lv_obj_remove_flag(status_time_, LV_OBJ_FLAG_HIDDEN);
@@ -799,12 +871,28 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             lv_obj_set_pos(qr_image_, kProvisionQrX, kProvisionQrY);
             lv_obj_add_flag(qr_image_, LV_OBJ_FLAG_HIDDEN);
 
-            status_time_ = MakeLabel(v4_layer_, text_font, 0xFFFFFF);
-            lv_obj_align(status_time_, LV_ALIGN_TOP_LEFT, 70, 48);
-            status_wifi_ = MakeLabel(v4_layer_, icon_font, 0xFFFFFF);
-            lv_obj_align(status_wifi_, LV_ALIGN_TOP_LEFT, 140, 50);
-            status_battery_ = MakeLabel(v4_layer_, icon_font, 0xFFFFFF);
-            lv_obj_align(status_battery_, LV_ALIGN_TOP_LEFT, 175, 50);
+            status_time_ = MakeLabel(v4_layer_, &font_noto_sans_basic_20_4, 0xFFFFFF);
+            status_wifi_ = MakeLabel(v4_layer_, &font_material_symbols_30_4, 0xFFFFFF);
+            status_battery_ = MakeLabel(v4_layer_, &font_material_symbols_30_4, 0xFFFFFF);
+            ApplyMainStatusLayout();
+
+            // Screen 4: lime vector checkmark (~60 px), centered near (206, 150).
+            ready_check_ = lv_line_create(v4_layer_);
+            {
+                static lv_point_precise_t check_pts[] = {
+                    {14, 34},
+                    {28, 50},
+                    {58, 12},
+                };
+                lv_line_set_points(ready_check_, check_pts, 3);
+                lv_obj_set_style_line_width(ready_check_, 8, 0);
+                lv_obj_set_style_line_color(ready_check_, lv_color_hex(kPerimeterColor), 0);
+                lv_obj_set_style_line_rounded(ready_check_, true, 0);
+                lv_obj_set_style_line_opa(ready_check_, LV_OPA_COVER, 0);
+                // Bounding box ~72×62 → visual center ≈ (206, 150).
+                lv_obj_set_pos(ready_check_, kReadyCheckCenterX - 36, kReadyCheckCenterY - 31);
+                lv_obj_add_flag(ready_check_, LV_OBJ_FLAG_HIDDEN);
+            }
 
             nexus_logo_ = MakeLabel(v4_layer_, text_font, 0xFFFFFF);
             lv_label_set_text(nexus_logo_, "NEXUS");
@@ -883,6 +971,9 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lvgl_theme->icon_font() != nullptr ? lvgl_theme->icon_font()->font() : nullptr;
             RebindV4TextFonts(text_font, icon_font);
             AssertV4LowBatteryStyle(text_font);
+            if (screen_ == V4Screen::Main) {
+                ApplyMainStatusLayout();
+            }
         }
 
         // Screen-off + listening: blank panel; on wake restore correct V4 screen.
