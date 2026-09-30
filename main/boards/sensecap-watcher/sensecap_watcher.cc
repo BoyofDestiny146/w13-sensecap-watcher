@@ -167,6 +167,9 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         static constexpr int kVolumeMin = 0;
         static constexpr int kVolumeMax = 100;
         static constexpr int64_t kWheelRotateDebounceUs = 120000;  // 120 ms
+        // Volume number during Listening/Speaking adjust — bottom gap between perimeter arcs.
+        static constexpr int kVolumeOverlayCenterX = 206;
+        static constexpr int kVolumeOverlayCenterY = 338;
 
         static bool IsClockText(const char* status) {
             return status != nullptr && strlen(status) == 5 && status[2] == ':' &&
@@ -486,11 +489,68 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             }
         }
 
-        void RefreshVolumeOverlay() {
+        bool IsConversationScreen() const {
+            return screen_ == V4Screen::Listening || screen_ == V4Screen::Speaking;
+        }
+
+        void HideVolumeNumberOverlay() {
+            if (body_label_ != nullptr) {
+                lv_obj_add_flag(body_label_, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_style_text_opa(body_label_, LV_OPA_COVER, 0);
+            }
+            if (title_label_ != nullptr) {
+                lv_obj_add_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (subtitle_label_ != nullptr) {
+                lv_obj_add_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+
+        // Listening/Speaking: keep face + labels; only show live volume in lower arc gap.
+        void ShowConversationVolumeNumber() {
             auto codec = Board::GetInstance().GetAudioCodec();
             const int vol = codec != nullptr ? codec->output_volume() : 0;
             char buf[16];
-            snprintf(buf, sizeof(buf), "%d", vol);
+            snprintf(buf, sizeof(buf), "%d%%", vol);
+
+            if (title_label_ != nullptr) {
+                lv_obj_add_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (subtitle_label_ != nullptr) {
+                lv_obj_add_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (body_label_ != nullptr) {
+                auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+                const lv_font_t* text_font =
+                    (lvgl_theme != nullptr && lvgl_theme->text_font() != nullptr)
+                        ? lvgl_theme->text_font()->font()
+                        : nullptr;
+                if (text_font != nullptr) {
+                    lv_obj_set_style_text_font(body_label_, text_font, 0);  // ~30 px board text
+                }
+                lv_label_set_text(body_label_, buf);
+                lv_obj_set_style_text_color(body_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_text_opa(body_label_, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_align(body_label_, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_set_width(body_label_, LV_SIZE_CONTENT);
+                PlaceLabelAtCenter(body_label_, kVolumeOverlayCenterX, kVolumeOverlayCenterY,
+                                   LV_SCALE_NONE);
+                lv_obj_remove_flag(body_label_, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(body_label_);
+            }
+            ApplyMenuSelectionVisuals();
+            BringPerimeterFront();
+        }
+
+        void RefreshVolumeOverlay() {
+            auto codec = Board::GetInstance().GetAudioCodec();
+            const int vol = codec != nullptr ? codec->output_volume() : 0;
+            if (IsConversationScreen()) {
+                ShowConversationVolumeNumber();
+                return;
+            }
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d%%", vol);
             ShowOverlayText("Volume", buf, nullptr);
         }
 
@@ -517,7 +577,29 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         void ReturnToMainWithSelection() {
             wheel_mode_ = WheelMode::Browse;
             wifi_confirm_yes_ = false;
+            HideVolumeNumberOverlay();
             ShowMainScreen();
+        }
+
+        // After Tasks / Volume / Wi-Fi cancel: restore whatever conversation state still owns.
+        void ReturnFromOverlayWithSelection() {
+            wheel_mode_ = WheelMode::Browse;
+            wifi_confirm_yes_ = false;
+            HideVolumeNumberOverlay();
+            ClearOverlayOptionStyles();
+            auto state = Application::GetInstance().GetDeviceState();
+            if (state == kDeviceStateListening) {
+                ShowListeningScreen();
+            } else if (state == kDeviceStateSpeaking || state == kDeviceStateNotifying) {
+                ShowSpeakingScreen();
+            } else {
+                ShowMainScreen();
+            }
+        }
+
+        void ExitVolumeAdjustMode() {
+            ESP_LOGI(TAG, "Wheel volume adjust exit");
+            ReturnFromOverlayWithSelection();
         }
 
         void MoveMenuSelection(bool clockwise) {
@@ -549,29 +631,27 @@ class CustomLcdDisplay : public SpiLcdDisplay {
 
         void ActivateSelectedMenuItem() {
             switch (menu_selected_) {
-                case WheelMenuItem::Talk:
-                    // Idle → Listening (or leave Listening/Speaking). Approved V4 Listening preserved.
-                    Application::GetInstance().ToggleChatState();
-                    break;
-                case WheelMenuItem::Tasks:
-                    if (screen_ != V4Screen::Main) {
-                        ESP_LOGI(TAG, "Tasks activates on Main only (selection kept)");
-                        return;
+                case WheelMenuItem::Talk: {
+                    // Idle → start; Listening/Speaking → end via ToggleChatState (no double-start).
+                    auto state = Application::GetInstance().GetDeviceState();
+                    if (state == kDeviceStateIdle || state == kDeviceStateListening ||
+                        state == kDeviceStateSpeaking || state == kDeviceStateNotifying) {
+                        Application::GetInstance().ToggleChatState();
+                    } else {
+                        ESP_LOGI(TAG, "Talk ignored in device state %d", (int)state);
                     }
+                    break;
+                }
+                case WheelMenuItem::Tasks:
+                    // Allowed on Main / Listening / Speaking — placeholder only.
                     ShowTasksPlaceholder();
                     break;
                 case WheelMenuItem::Volume:
-                    if (screen_ != V4Screen::Main) {
-                        ESP_LOGI(TAG, "Volume adjust activates on Main only (selection kept)");
-                        return;
-                    }
+                    // Allowed during conversation; face stays visible on Listening/Speaking.
                     ShowVolumeAdjustMode();
                     break;
                 case WheelMenuItem::ChangeWifi:
-                    if (screen_ != V4Screen::Main) {
-                        ESP_LOGI(TAG, "Change Wi-Fi confirm activates on Main only (selection kept)");
-                        return;
-                    }
+                    // Confirm from Main / Listening / Speaking; clear only after Yes.
                     ShowWifiConfirmMode();
                     break;
                 default:
@@ -890,45 +970,75 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         void ShowListeningScreen() {
             screen_ = V4Screen::Listening;
             ready_splash_active_ = false;
-            EnterBrowseMode();
+            // Keep Tasks / Wi-Fi / Volume modes across Listening↔Speaking transitions.
+            const bool keep_volume = (wheel_mode_ == WheelMode::VolumeAdjust);
+            const bool keep_modal = (wheel_mode_ == WheelMode::TasksPlaceholder ||
+                                     wheel_mode_ == WheelMode::WifiConfirm);
+            if (!keep_volume && !keep_modal) {
+                EnterBrowseMode();
+            }
             ClearProvisionScales();
             ShowV4Layer();
-            HideAllContent();
+            if (!keep_modal) {
+                HideAllContent();
 
-            if (listening_label_ != nullptr) {
-                lv_label_set_text(listening_label_, "Listening");
-                lv_obj_remove_flag(listening_label_, LV_OBJ_FLAG_HIDDEN);
+                if (listening_label_ != nullptr) {
+                    lv_label_set_text(listening_label_, "Listening");
+                    lv_obj_remove_flag(listening_label_, LV_OBJ_FLAG_HIDDEN);
+                }
+
+                // Closest built-in yellow happy face (approved — size/position unchanged).
+                SpiLcdDisplay::SetEmotion("happy");
+                if (emoji_box_ != nullptr) {
+                    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
+                    lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+                }
+
+                if (keep_volume) {
+                    ShowConversationVolumeNumber();
+                } else {
+                    ApplyMenuSelectionVisuals();
+                    BringPerimeterFront();
+                }
+            } else {
+                // Modal overlay owns the center; only track screen_ for return path.
+                ApplyMenuSelectionVisuals();
+                BringPerimeterFront();
             }
-
-            // Closest built-in yellow happy face (approved — size/position unchanged).
-            SpiLcdDisplay::SetEmotion("happy");
-            if (emoji_box_ != nullptr) {
-                lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
-                lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
-            }
-
-            ApplyMenuSelectionVisuals();
-            BringPerimeterFront();
         }
 
         void ShowSpeakingScreen() {
             screen_ = V4Screen::Speaking;
             ready_splash_active_ = false;
-            EnterBrowseMode();
+            const bool keep_volume = (wheel_mode_ == WheelMode::VolumeAdjust);
+            const bool keep_modal = (wheel_mode_ == WheelMode::TasksPlaceholder ||
+                                     wheel_mode_ == WheelMode::WifiConfirm);
+            if (!keep_volume && !keep_modal) {
+                EnterBrowseMode();
+            }
             ClearProvisionScales();
             ShowV4Layer();
-            HideAllContent();
+            if (!keep_modal) {
+                HideAllContent();
 
-            if (listening_label_ != nullptr) {
-                lv_label_set_text(listening_label_, "Speaking");
-                lv_obj_remove_flag(listening_label_, LV_OBJ_FLAG_HIDDEN);
+                if (listening_label_ != nullptr) {
+                    lv_label_set_text(listening_label_, "Speaking");
+                    lv_obj_remove_flag(listening_label_, LV_OBJ_FLAG_HIDDEN);
+                }
+                if (emoji_box_ != nullptr) {
+                    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
+                    lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+                }
+                if (keep_volume) {
+                    ShowConversationVolumeNumber();
+                } else {
+                    ApplyMenuSelectionVisuals();
+                    BringPerimeterFront();
+                }
+            } else {
+                ApplyMenuSelectionVisuals();
+                BringPerimeterFront();
             }
-            if (emoji_box_ != nullptr) {
-                lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
-                lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
-            }
-            ApplyMenuSelectionVisuals();
-            BringPerimeterFront();
         }
 
         void ShowBenchScreenIndex(int index) {
@@ -1304,12 +1414,11 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                         ActivateSelectedMenuItem();
                         return true;
                     case WheelMode::VolumeAdjust:
-                        ESP_LOGI(TAG, "Wheel volume adjust exit");
-                        ReturnToMainWithSelection();
+                        ExitVolumeAdjustMode();
                         return true;
                     case WheelMode::TasksPlaceholder:
                         ESP_LOGI(TAG, "Tasks placeholder exit");
-                        ReturnToMainWithSelection();
+                        ReturnFromOverlayWithSelection();
                         return true;
                     case WheelMode::WifiConfirm:
                         if (wifi_confirm_yes_) {
@@ -1317,7 +1426,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                             clear_wifi_and_reboot = true;
                         } else {
                             ESP_LOGI(TAG, "Change Wi-Fi confirmation: No — cancelled");
-                            ReturnToMainWithSelection();
+                            ReturnFromOverlayWithSelection();
                         }
                         break;
                     case WheelMode::Inactive:
@@ -1334,7 +1443,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                     ESP_LOGE(TAG, "Change Wi-Fi: SsidManager::Clear() left %u network(s)",
                              (unsigned)ssids.GetSsidList().size());
                     DisplayLockGuard lock(this);
-                    ReturnToMainWithSelection();
+                    ReturnFromOverlayWithSelection();
                     return true;
                 }
                 ESP_LOGW(TAG,
