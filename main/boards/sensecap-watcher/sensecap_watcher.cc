@@ -12,6 +12,7 @@
 #include "sscma_camera.h"
 #include "lvgl_theme.h"
 #include "nexus_wifi_qr.h"
+#include "ssid_manager.h"
 
 #include <esp_log.h>
 #include <esp_check.h>
@@ -78,7 +79,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             Browse,            // rotate moves selection; click activates
             VolumeAdjust,      // rotate changes speaker volume; click exits
             TasksPlaceholder,  // "Tasks" / "Coming soon"; click exits
-            WifiConfirm,       // CHANGE WI-FI? No/Yes prototype; click confirms
+            WifiConfirm,       // CHANGE WI-FI? No/Yes; Yes clears STA creds + reboot
         };
 
         lv_obj_t* v4_layer_ = nullptr;
@@ -1292,37 +1293,58 @@ class CustomLcdDisplay : public SpiLcdDisplay {
 #if W13_V4_UI_BENCH_MODE
             return false;
 #else
-            DisplayLockGuard lock(this);
-            switch (wheel_mode_) {
-                case WheelMode::Browse:
-                    if (!IsMenuScreen()) {
+            bool clear_wifi_and_reboot = false;
+            {
+                DisplayLockGuard lock(this);
+                switch (wheel_mode_) {
+                    case WheelMode::Browse:
+                        if (!IsMenuScreen()) {
+                            return false;
+                        }
+                        ActivateSelectedMenuItem();
+                        return true;
+                    case WheelMode::VolumeAdjust:
+                        ESP_LOGI(TAG, "Wheel volume adjust exit");
+                        ReturnToMainWithSelection();
+                        return true;
+                    case WheelMode::TasksPlaceholder:
+                        ESP_LOGI(TAG, "Tasks placeholder exit");
+                        ReturnToMainWithSelection();
+                        return true;
+                    case WheelMode::WifiConfirm:
+                        if (wifi_confirm_yes_) {
+                            // Clear STA credentials then reboot (outside LVGL lock).
+                            clear_wifi_and_reboot = true;
+                        } else {
+                            ESP_LOGI(TAG, "Change Wi-Fi confirmation: No — cancelled");
+                            ReturnToMainWithSelection();
+                        }
+                        break;
+                    case WheelMode::Inactive:
+                    default:
                         return false;
-                    }
-                    ActivateSelectedMenuItem();
-                    return true;
-                case WheelMode::VolumeAdjust:
-                    ESP_LOGI(TAG, "Wheel volume adjust exit");
-                    ReturnToMainWithSelection();
-                    return true;
-                case WheelMode::TasksPlaceholder:
-                    ESP_LOGI(TAG, "Tasks placeholder exit");
-                    ReturnToMainWithSelection();
-                    return true;
-                case WheelMode::WifiConfirm:
-                    if (wifi_confirm_yes_) {
-                        // Prototype only — do NOT erase credentials / enter config.
-                        ESP_LOGW(TAG,
-                                 "Change Wi-Fi confirmation reached: YES "
-                                 "(credentials NOT erased — prototype only)");
-                    } else {
-                        ESP_LOGI(TAG, "Change Wi-Fi confirmation: No — cancelled");
-                    }
-                    ReturnToMainWithSelection();
-                    return true;
-                case WheelMode::Inactive:
-                default:
-                    return false;
+                }
             }
+
+            if (clear_wifi_and_reboot) {
+                // Credential keys only via SsidManager — never nvs_flash_erase / namespace wipe.
+                auto& ssids = SsidManager::GetInstance();
+                ssids.Clear();  // void; verify by empty list
+                if (!ssids.GetSsidList().empty()) {
+                    ESP_LOGE(TAG, "Change Wi-Fi: SsidManager::Clear() left %u network(s)",
+                             (unsigned)ssids.GetSsidList().size());
+                    DisplayLockGuard lock(this);
+                    ReturnToMainWithSelection();
+                    return true;
+                }
+                ESP_LOGW(TAG,
+                         "Change Wi-Fi: saved STA credentials cleared; rebooting to provisioning "
+                         "(UUID / websocket / ota_url preserved)");
+                Application::GetInstance().Reboot();
+                // Reboot does not return under normal conditions.
+                return true;
+            }
+            return true;
 #endif
         }
 
