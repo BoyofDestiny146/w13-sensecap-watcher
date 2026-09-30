@@ -59,9 +59,11 @@ public:
 // SPI LCD display
 class SpiLcdDisplay : public LcdDisplay {
 public:
+    // clear_color: RGB565 fill applied before lv_init / lvgl_port_add_disp.
+    // Default white preserves existing boards; SenseCap V4 passes black (0x0000).
     SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
                   int height, int offset_x, int offset_y, bool mirror_x, bool mirror_y,
-                  bool swap_xy);
+                  bool swap_xy, uint16_t clear_color = 0xFFFF);
 };
 
 // RGB LCD display

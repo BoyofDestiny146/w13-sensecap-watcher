@@ -842,8 +842,9 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle, esp_lcd_panel_handle_t panel_handle,
                          int width, int height, int offset_x, int offset_y, bool mirror_x,
                          bool mirror_y, bool swap_xy)
+            // Black pre-LVGL clear so early RestoreBrightness never flashes white.
             : SpiLcdDisplay(io_handle, panel_handle, width, height, offset_x, offset_y, mirror_x,
-                            mirror_y, swap_xy) {}
+                            mirror_y, swap_xy, /*clear_color=*/0x0000) {}
 
         virtual void SetupUI() override {
             SpiLcdDisplay::SetupUI();
@@ -962,15 +963,13 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ready_args.name = "v4_ready";
             ESP_ERROR_CHECK(esp_timer_create(&ready_args, &ready_timer_));
 
-            // V4 boot UI first (backlight still off until this returns to the board).
+            // V4 boot UI; force a synchronous LVGL flush so GRAM holds this frame.
             ShowBootInitializingScreen();
+            lv_refr_now(display_);
 #if W13_V4_UI_BENCH_MODE
             ESP_LOGW(TAG, "V4 UI BENCH MODE ON — boot shown; knob rotate cycles 6 screens; click=Talk");
 #endif
             }
-
-            // Preferred white-flash kill: light panel only after V4 boot is composed.
-            Board::GetInstance().GetBacklight()->RestoreBrightness();
         }
 
         // TEMPORARY bench API: knob rotation cycles the 6 V4 screens for photo validation.
@@ -1452,14 +1451,6 @@ private:
         display_ = new CustomLcdDisplay(panel_io_, panel_,
             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
 
-        // SpiLcdDisplay ctor fills white before LVGL; overwrite with black while backlight is off.
-        {
-            std::vector<uint16_t> black_row(DISPLAY_WIDTH, 0x0000);
-            for (int y = 0; y < DISPLAY_HEIGHT; y++) {
-                esp_lcd_panel_draw_bitmap(panel_, 0, y, DISPLAY_WIDTH, y + 1, black_row.data());
-            }
-        }
-
         // 使每次刷新的起始列数索引是4的倍数且列数总数是4的倍数，以满足SPD2010的要求
         lv_display_add_event_cb(lv_display_get_default(), [](lv_event_t *e) {
             lv_area_t *area = (lv_area_t *)lv_event_get_param(e);
@@ -1687,9 +1678,8 @@ public:
         InitializeButton();
         InitializeKnob();
         Initializespd2010Display();
-        // Keep backlight OFF until CustomLcdDisplay::SetupUI shows the V4 boot screen.
-        // (Previously RestoreBrightness ran here and flashed the white pre-LVGL fill.)
-        GetBacklight()->SetBrightness(0);
+        // Normal SenseCap startup: PWM backlight ramps after display init (GRAM is black).
+        GetBacklight()->RestoreBrightness();
         InitializeCamera();
     }
 
