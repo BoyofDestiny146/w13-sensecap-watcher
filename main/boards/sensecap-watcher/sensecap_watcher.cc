@@ -44,11 +44,10 @@ LV_FONT_DECLARE(font_material_symbols_30_4);
 
 #define TAG "sensecap_watcher"
 
-// TEMPORARY: board-local V4 UI bench mode for visual validation of all 6 screens.
-// Knob ROTATION cycles screens; knob CLICK still ToggleChatState / Talk.
-// Set to 0 before production / after bench photos. Does not touch NVS, Wi-Fi, OTA, or audio.
+// V4 UI bench mode (knob-rotation screen cycling). Keep at 0 for real automatic V4 flow.
+// Rendering helpers (Show*Screen) remain; only navigation ownership changes.
 #ifndef W13_V4_UI_BENCH_MODE
-#define W13_V4_UI_BENCH_MODE 1
+#define W13_V4_UI_BENCH_MODE 0
 #endif
 
 class CustomLcdDisplay : public SpiLcdDisplay {
@@ -724,11 +723,20 @@ class CustomLcdDisplay : public SpiLcdDisplay {
 #endif
             auto state = Application::GetInstance().GetDeviceState();
             switch (state) {
+                case kDeviceStateStarting:
+                    ShowBootInitializingScreen();
+                    break;
                 case kDeviceStateWifiConfiguring:
                     ShowProvisionQrScreen();
                     break;
                 case kDeviceStateConnecting:
-                    ShowWaitingWifiScreen();
+                    // Chat channel open also uses Connecting; only Screen 2 during provisioning.
+                    if (screen_ == V4Screen::ProvisionQr || screen_ == V4Screen::WaitingWifi ||
+                        screen_ == V4Screen::Binding) {
+                        ShowWaitingWifiScreen();
+                    } else {
+                        ShowMainScreen();
+                    }
                     break;
                 case kDeviceStateActivating:
                     ShowBindingScreen(binding_ui_shown_);
@@ -964,10 +972,13 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ESP_ERROR_CHECK(esp_timer_create(&ready_args, &ready_timer_));
 
             // V4 boot UI; force a synchronous LVGL flush so GRAM holds this frame.
+            // Real flow: SetStatus / device-state mapping advances screens automatically.
             ShowBootInitializingScreen();
             lv_refr_now(display_);
 #if W13_V4_UI_BENCH_MODE
             ESP_LOGW(TAG, "V4 UI BENCH MODE ON — boot shown; knob rotate cycles 6 screens; click=Talk");
+#else
+            ESP_LOGI(TAG, "V4 UI real flow — boot shown; knob click=Talk; rotation=volume");
 #endif
             }
         }
@@ -1295,6 +1306,7 @@ private:
         return;
 #endif
 
+        // Stock SenseCap: knob rotation adjusts volume. No V4 menu selection yet.
         auto codec = GetAudioCodec();
         int current_volume = codec->output_volume();
         int new_volume = current_volume + (clockwise ? -5 : 5);
