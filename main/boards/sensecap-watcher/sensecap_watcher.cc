@@ -366,13 +366,12 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             if (icon == nullptr) {
                 return;
             }
-            // Geometry untouched — selection via opacity + white outline only.
-            lv_obj_set_style_text_opa(icon, selected ? LV_OPA_COVER : LV_OPA_40, 0);
+            // Geometry untouched — selection = green brightness only (no outline/box/glow).
             lv_obj_set_style_text_color(icon, lv_color_hex(kPerimeterColor), 0);
-            lv_obj_set_style_outline_width(icon, selected ? 3 : 0, 0);
-            lv_obj_set_style_outline_pad(icon, selected ? 6 : 0, 0);
-            lv_obj_set_style_outline_color(icon, lv_color_hex(0xFFFFFF), 0);
-            lv_obj_set_style_outline_opa(icon, selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            lv_obj_set_style_text_opa(icon, selected ? LV_OPA_COVER : LV_OPA_40, 0);
+            lv_obj_set_style_outline_width(icon, 0, 0);
+            lv_obj_set_style_outline_pad(icon, 0, 0);
+            lv_obj_set_style_outline_opa(icon, LV_OPA_TRANSP, 0);
         }
 
         void ApplyMenuSelectionVisuals() {
@@ -471,23 +470,18 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         }
 
         void ApplyWifiConfirmOptionVisuals() {
-            // No = subtitle, Yes = body. Selected option: full opacity + outline.
+            // No = subtitle, Yes = body. Selection = brightness only (no outline).
             if (subtitle_label_ != nullptr) {
                 const bool selected = !wifi_confirm_yes_;
                 lv_obj_set_style_text_opa(subtitle_label_, selected ? LV_OPA_COVER : LV_OPA_40, 0);
-                lv_obj_set_style_outline_width(subtitle_label_, selected ? 2 : 0, 0);
-                lv_obj_set_style_outline_pad(subtitle_label_, selected ? 4 : 0, 0);
-                lv_obj_set_style_outline_color(subtitle_label_, lv_color_hex(0xFFFFFF), 0);
-                lv_obj_set_style_outline_opa(subtitle_label_, selected ? LV_OPA_COVER : LV_OPA_TRANSP,
-                                            0);
+                lv_obj_set_style_outline_width(subtitle_label_, 0, 0);
+                lv_obj_set_style_outline_opa(subtitle_label_, LV_OPA_TRANSP, 0);
             }
             if (body_label_ != nullptr) {
                 const bool selected = wifi_confirm_yes_;
                 lv_obj_set_style_text_opa(body_label_, selected ? LV_OPA_COVER : LV_OPA_40, 0);
-                lv_obj_set_style_outline_width(body_label_, selected ? 2 : 0, 0);
-                lv_obj_set_style_outline_pad(body_label_, selected ? 4 : 0, 0);
-                lv_obj_set_style_outline_color(body_label_, lv_color_hex(0xFFFFFF), 0);
-                lv_obj_set_style_outline_opa(body_label_, selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+                lv_obj_set_style_outline_width(body_label_, 0, 0);
+                lv_obj_set_style_outline_opa(body_label_, LV_OPA_TRANSP, 0);
             }
         }
 
