@@ -32,6 +32,7 @@
 #include <esp_app_desc.h>
 
 #include <cctype>
+#include <cstdio>
 #include <ctime>
 #include <cstring>
 #include <vector>
@@ -61,6 +62,23 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             Main,
             Listening,
             Speaking,
+        };
+
+        // Right-arc wheel menu (Main / Listening / Speaking). Geometry unchanged.
+        enum class WheelMenuItem : int {
+            Talk = 0,
+            Tasks = 1,
+            Volume = 2,
+            ChangeWifi = 3,
+            Count = 4,
+        };
+
+        enum class WheelMode {
+            Inactive,          // provisioning / boot / ready — menu not interactive
+            Browse,            // rotate moves selection; click activates
+            VolumeAdjust,      // rotate changes speaker volume; click exits
+            TasksPlaceholder,  // "Tasks" / "Coming soon"; click exits
+            WifiConfirm,       // CHANGE WI-FI? No/Yes prototype; click confirms
         };
 
         lv_obj_t* v4_layer_ = nullptr;
@@ -98,6 +116,11 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         V4Screen screen_ = V4Screen::Boot;
         int bench_index_ = 0;
         int64_t last_bench_cycle_us_ = 0;
+        int64_t last_wheel_rotate_us_ = 0;
+
+        WheelMenuItem menu_selected_ = WheelMenuItem::Talk;  // initial selection
+        WheelMode wheel_mode_ = WheelMode::Inactive;
+        bool wifi_confirm_yes_ = false;  // default No on Change Wi-Fi confirm
 
         static constexpr uint32_t kPerimeterColor = 0x7CFF14;  // lime green per V4
         static constexpr int kPerimeterSize = 408;
@@ -139,6 +162,10 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         static constexpr int kStatusBatteryX = 280;
         static constexpr int kStatusBatteryY = 78;
         static constexpr int kBenchScreenCount = 6;
+        static constexpr int kVolumeStep = 5;
+        static constexpr int kVolumeMin = 0;
+        static constexpr int kVolumeMax = 100;
+        static constexpr int64_t kWheelRotateDebounceUs = 120000;  // 120 ms
 
         static bool IsClockText(const char* status) {
             return status != nullptr && strlen(status) == 5 && status[2] == ':' &&
@@ -335,26 +362,225 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             PlaceSideIconAtCenter(icon_wifi_, kSideIconWifiX, kSideIconWifiY);
         }
 
-        void ShowSideIcons(bool talk_active) {
+        void ApplyIconSelectionStyle(lv_obj_t* icon, bool selected) {
+            if (icon == nullptr) {
+                return;
+            }
+            // Geometry untouched — selection via opacity + white outline only.
+            lv_obj_set_style_text_opa(icon, selected ? LV_OPA_COVER : LV_OPA_40, 0);
+            lv_obj_set_style_text_color(icon, lv_color_hex(kPerimeterColor), 0);
+            lv_obj_set_style_outline_width(icon, selected ? 3 : 0, 0);
+            lv_obj_set_style_outline_pad(icon, selected ? 6 : 0, 0);
+            lv_obj_set_style_outline_color(icon, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_outline_opa(icon, selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        }
+
+        void ApplyMenuSelectionVisuals() {
             ApplySideIconLayout();
-            if (icon_talk_ != nullptr) {
-                lv_obj_set_style_text_opa(icon_talk_, talk_active ? LV_OPA_COVER : LV_OPA_40, 0);
+            ApplyIconSelectionStyle(icon_talk_, menu_selected_ == WheelMenuItem::Talk);
+            ApplyIconSelectionStyle(icon_task_, menu_selected_ == WheelMenuItem::Tasks);
+            ApplyIconSelectionStyle(icon_volume_, menu_selected_ == WheelMenuItem::Volume);
+            ApplyIconSelectionStyle(icon_wifi_, menu_selected_ == WheelMenuItem::ChangeWifi);
+            if (icon_talk_ != nullptr)
                 lv_obj_remove_flag(icon_talk_, LV_OBJ_FLAG_HIDDEN);
-            }
-            if (icon_task_ != nullptr) {
-                // Visual placeholder only — no Tasks behavior yet.
-                lv_obj_set_style_text_opa(icon_task_, LV_OPA_30, 0);
+            if (icon_task_ != nullptr)
                 lv_obj_remove_flag(icon_task_, LV_OBJ_FLAG_HIDDEN);
-            }
-            if (icon_volume_ != nullptr) {
-                // Visual placeholder only — no Volume behavior yet.
-                lv_obj_set_style_text_opa(icon_volume_, LV_OPA_30, 0);
+            if (icon_volume_ != nullptr)
                 lv_obj_remove_flag(icon_volume_, LV_OBJ_FLAG_HIDDEN);
-            }
-            if (icon_wifi_ != nullptr) {
-                // Visual placeholder only — no Change Wi-Fi behavior yet.
-                lv_obj_set_style_text_opa(icon_wifi_, LV_OPA_30, 0);
+            if (icon_wifi_ != nullptr)
                 lv_obj_remove_flag(icon_wifi_, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        void ShowSideIcons(bool /*talk_active*/) {
+            // talk_active retained for call-site compatibility; selection owns highlight.
+            ApplyMenuSelectionVisuals();
+        }
+
+        bool IsMenuScreen() const {
+            return screen_ == V4Screen::Main || screen_ == V4Screen::Listening ||
+                   screen_ == V4Screen::Speaking;
+        }
+
+        void EnterBrowseMode() {
+            wheel_mode_ = WheelMode::Browse;
+            wifi_confirm_yes_ = false;
+        }
+
+        void HideCenterChromeForOverlay() {
+            if (nexus_logo_ != nullptr)
+                lv_obj_add_flag(nexus_logo_, LV_OBJ_FLAG_HIDDEN);
+            if (listening_label_ != nullptr)
+                lv_obj_add_flag(listening_label_, LV_OBJ_FLAG_HIDDEN);
+            if (emoji_box_ != nullptr)
+                lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+            if (status_time_ != nullptr)
+                lv_obj_add_flag(status_time_, LV_OBJ_FLAG_HIDDEN);
+            if (status_wifi_ != nullptr)
+                lv_obj_add_flag(status_wifi_, LV_OBJ_FLAG_HIDDEN);
+            if (status_battery_ != nullptr)
+                lv_obj_add_flag(status_battery_, LV_OBJ_FLAG_HIDDEN);
+            if (ready_check_ != nullptr)
+                lv_obj_add_flag(ready_check_, LV_OBJ_FLAG_HIDDEN);
+            if (qr_image_ != nullptr)
+                lv_obj_add_flag(qr_image_, LV_OBJ_FLAG_HIDDEN);
+            if (icon_label_ != nullptr)
+                lv_obj_add_flag(icon_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        void ShowOverlayText(const char* title, const char* subtitle, const char* body) {
+            HideCenterChromeForOverlay();
+            if (title_label_ != nullptr) {
+                lv_label_set_text(title_label_, title != nullptr ? title : "");
+                lv_obj_set_style_text_color(title_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_text_opa(title_label_, LV_OPA_COVER, 0);
+                lv_obj_set_width(title_label_, LV_HOR_RES * 0.75);
+                lv_obj_set_style_text_align(title_label_, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_align(title_label_, LV_ALIGN_CENTER, -30, -40);
+                if (title != nullptr && title[0] != '\0') {
+                    lv_obj_remove_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_add_flag(title_label_, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+            if (subtitle_label_ != nullptr) {
+                lv_label_set_text(subtitle_label_, subtitle != nullptr ? subtitle : "");
+                lv_obj_set_style_text_color(subtitle_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_width(subtitle_label_, LV_HOR_RES * 0.75);
+                lv_obj_set_style_text_align(subtitle_label_, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_align(subtitle_label_, LV_ALIGN_CENTER, -30, 10);
+                if (subtitle != nullptr && subtitle[0] != '\0') {
+                    lv_obj_remove_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_add_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+            if (body_label_ != nullptr) {
+                lv_label_set_text(body_label_, body != nullptr ? body : "");
+                lv_obj_set_style_text_color(body_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_width(body_label_, LV_HOR_RES * 0.75);
+                lv_obj_set_style_text_align(body_label_, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_align(body_label_, LV_ALIGN_CENTER, -30, 55);
+                if (body != nullptr && body[0] != '\0') {
+                    lv_obj_remove_flag(body_label_, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_add_flag(body_label_, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+            ApplyMenuSelectionVisuals();
+            BringPerimeterFront();
+        }
+
+        void ApplyWifiConfirmOptionVisuals() {
+            // No = subtitle, Yes = body. Selected option: full opacity + outline.
+            if (subtitle_label_ != nullptr) {
+                const bool selected = !wifi_confirm_yes_;
+                lv_obj_set_style_text_opa(subtitle_label_, selected ? LV_OPA_COVER : LV_OPA_40, 0);
+                lv_obj_set_style_outline_width(subtitle_label_, selected ? 2 : 0, 0);
+                lv_obj_set_style_outline_pad(subtitle_label_, selected ? 4 : 0, 0);
+                lv_obj_set_style_outline_color(subtitle_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_outline_opa(subtitle_label_, selected ? LV_OPA_COVER : LV_OPA_TRANSP,
+                                            0);
+            }
+            if (body_label_ != nullptr) {
+                const bool selected = wifi_confirm_yes_;
+                lv_obj_set_style_text_opa(body_label_, selected ? LV_OPA_COVER : LV_OPA_40, 0);
+                lv_obj_set_style_outline_width(body_label_, selected ? 2 : 0, 0);
+                lv_obj_set_style_outline_pad(body_label_, selected ? 4 : 0, 0);
+                lv_obj_set_style_outline_color(body_label_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_outline_opa(body_label_, selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            }
+        }
+
+        void RefreshVolumeOverlay() {
+            auto codec = Board::GetInstance().GetAudioCodec();
+            const int vol = codec != nullptr ? codec->output_volume() : 0;
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", vol);
+            ShowOverlayText("Volume", buf, nullptr);
+        }
+
+        void ShowTasksPlaceholder() {
+            wheel_mode_ = WheelMode::TasksPlaceholder;
+            menu_selected_ = WheelMenuItem::Tasks;
+            ShowOverlayText("Tasks", "Coming soon", nullptr);
+        }
+
+        void ShowVolumeAdjustMode() {
+            wheel_mode_ = WheelMode::VolumeAdjust;
+            menu_selected_ = WheelMenuItem::Volume;
+            RefreshVolumeOverlay();
+        }
+
+        void ShowWifiConfirmMode() {
+            wheel_mode_ = WheelMode::WifiConfirm;
+            menu_selected_ = WheelMenuItem::ChangeWifi;
+            wifi_confirm_yes_ = false;  // default No
+            ShowOverlayText("CHANGE WI-FI?", "No", "Yes");
+            ApplyWifiConfirmOptionVisuals();
+        }
+
+        void ReturnToMainWithSelection() {
+            wheel_mode_ = WheelMode::Browse;
+            wifi_confirm_yes_ = false;
+            ShowMainScreen();
+        }
+
+        void MoveMenuSelection(bool clockwise) {
+            int idx = static_cast<int>(menu_selected_);
+            const int count = static_cast<int>(WheelMenuItem::Count);
+            idx = clockwise ? (idx + 1) % count : (idx - 1 + count) % count;
+            menu_selected_ = static_cast<WheelMenuItem>(idx);
+            ApplyMenuSelectionVisuals();
+            ESP_LOGI(TAG, "Wheel menu select %d", idx);
+        }
+
+        void AdjustSpeakerVolume(bool clockwise) {
+            auto codec = Board::GetInstance().GetAudioCodec();
+            if (codec == nullptr) {
+                return;
+            }
+            // Volume Adjust mode only: clockwise increases, counter-clockwise decreases.
+            int current = codec->output_volume();
+            int next = current + (clockwise ? kVolumeStep : -kVolumeStep);
+            if (next > kVolumeMax) {
+                next = kVolumeMax;
+            } else if (next < kVolumeMin) {
+                next = kVolumeMin;
+            }
+            codec->SetOutputVolume(next);
+            ESP_LOGI(TAG, "Wheel volume %d -> %d", current, next);
+            RefreshVolumeOverlay();
+        }
+
+        void ActivateSelectedMenuItem() {
+            switch (menu_selected_) {
+                case WheelMenuItem::Talk:
+                    // Idle → Listening (or leave Listening/Speaking). Approved V4 Listening preserved.
+                    Application::GetInstance().ToggleChatState();
+                    break;
+                case WheelMenuItem::Tasks:
+                    if (screen_ != V4Screen::Main) {
+                        ESP_LOGI(TAG, "Tasks activates on Main only (selection kept)");
+                        return;
+                    }
+                    ShowTasksPlaceholder();
+                    break;
+                case WheelMenuItem::Volume:
+                    if (screen_ != V4Screen::Main) {
+                        ESP_LOGI(TAG, "Volume adjust activates on Main only (selection kept)");
+                        return;
+                    }
+                    ShowVolumeAdjustMode();
+                    break;
+                case WheelMenuItem::ChangeWifi:
+                    if (screen_ != V4Screen::Main) {
+                        ESP_LOGI(TAG, "Change Wi-Fi confirm activates on Main only (selection kept)");
+                        return;
+                    }
+                    ShowWifiConfirmMode();
+                    break;
+                default:
+                    break;
             }
         }
 
@@ -370,6 +596,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         void ShowBootInitializingScreen() {
             screen_ = V4Screen::Boot;
             ready_splash_active_ = false;
+            wheel_mode_ = WheelMode::Inactive;
             ShowV4Layer();
             HideAllContent();
 
@@ -395,6 +622,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         void ShowProvisionQrScreen() {
             screen_ = V4Screen::ProvisionQr;
             ready_splash_active_ = false;
+            wheel_mode_ = WheelMode::Inactive;
             ShowV4Layer();
             HideAllContent();
 
@@ -453,6 +681,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         void ShowWaitingWifiScreen() {
             screen_ = V4Screen::WaitingWifi;
             ready_splash_active_ = false;
+            wheel_mode_ = WheelMode::Inactive;
             ClearProvisionScales();
             ShowV4Layer();
             HideAllContent();
@@ -490,6 +719,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 binding_ui_shown_ = true;
             }
             ready_splash_active_ = false;
+            wheel_mode_ = WheelMode::Inactive;
             ClearProvisionScales();
             ShowV4Layer();
             HideAllContent();
@@ -536,6 +766,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         void ShowReadySplashScreen() {
             screen_ = V4Screen::ReadySplash;
             ready_splash_active_ = true;
+            wheel_mode_ = WheelMode::Inactive;
 #if !W13_V4_UI_BENCH_MODE
             binding_ui_shown_ = false;
 #endif
@@ -617,10 +848,27 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             }
         }
 
+        void ClearOverlayOptionStyles() {
+            auto clear = [](lv_obj_t* obj) {
+                if (obj == nullptr) {
+                    return;
+                }
+                lv_obj_set_style_outline_width(obj, 0, 0);
+                lv_obj_set_style_outline_pad(obj, 0, 0);
+                lv_obj_set_style_outline_opa(obj, LV_OPA_TRANSP, 0);
+                lv_obj_set_style_text_opa(obj, LV_OPA_COVER, 0);
+            };
+            clear(title_label_);
+            clear(subtitle_label_);
+            clear(body_label_);
+        }
+
         void ShowMainScreen() {
             screen_ = V4Screen::Main;
             ready_splash_active_ = false;
+            EnterBrowseMode();
             ClearProvisionScales();
+            ClearOverlayOptionStyles();
             ShowV4Layer();
             HideAllContent();
             RefreshStatusRow();
@@ -640,13 +888,14 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lv_obj_remove_flag(nexus_logo_, LV_OBJ_FLAG_HIDDEN);
             }
 
-            ShowSideIcons(true);
+            ApplyMenuSelectionVisuals();
             BringPerimeterFront();
         }
 
         void ShowListeningScreen() {
             screen_ = V4Screen::Listening;
             ready_splash_active_ = false;
+            EnterBrowseMode();
             ClearProvisionScales();
             ShowV4Layer();
             HideAllContent();
@@ -663,13 +912,14 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
             }
 
-            ShowSideIcons(true);
+            ApplyMenuSelectionVisuals();
             BringPerimeterFront();
         }
 
         void ShowSpeakingScreen() {
             screen_ = V4Screen::Speaking;
             ready_splash_active_ = false;
+            EnterBrowseMode();
             ClearProvisionScales();
             ShowV4Layer();
             HideAllContent();
@@ -682,7 +932,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 lv_obj_align(emoji_box_, LV_ALIGN_CENTER, -20, 10);
                 lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
             }
-            ShowSideIcons(true);
+            ApplyMenuSelectionVisuals();
             BringPerimeterFront();
         }
 
@@ -978,7 +1228,8 @@ class CustomLcdDisplay : public SpiLcdDisplay {
 #if W13_V4_UI_BENCH_MODE
             ESP_LOGW(TAG, "V4 UI BENCH MODE ON — boot shown; knob rotate cycles 6 screens; click=Talk");
 #else
-            ESP_LOGI(TAG, "V4 UI real flow — boot shown; knob click=Talk; rotation=volume");
+            ESP_LOGI(TAG,
+                     "V4 UI real flow — wheel menu: rotate=select, click=activate (Talk default)");
 #endif
             }
         }
@@ -1000,6 +1251,84 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             ShowBenchScreenIndex(bench_index_ + (clockwise ? 1 : -1));
 #else
             (void)clockwise;
+#endif
+        }
+
+        // Wheel menu: rotate moves selection / adjusts volume; click activates.
+        // Returns true if the event was consumed (caller should not run stock fallbacks).
+        bool HandleWheelRotate(bool clockwise) {
+#if W13_V4_UI_BENCH_MODE
+            (void)clockwise;
+            return false;
+#else
+            const int64_t now = esp_timer_get_time();
+            if (now - last_wheel_rotate_us_ < kWheelRotateDebounceUs) {
+                return wheel_mode_ != WheelMode::Inactive;
+            }
+            last_wheel_rotate_us_ = now;
+
+            DisplayLockGuard lock(this);
+            switch (wheel_mode_) {
+                case WheelMode::Browse:
+                    if (!IsMenuScreen()) {
+                        return false;
+                    }
+                    MoveMenuSelection(clockwise);
+                    return true;
+                case WheelMode::VolumeAdjust:
+                    AdjustSpeakerVolume(clockwise);
+                    return true;
+                case WheelMode::WifiConfirm:
+                    wifi_confirm_yes_ = !wifi_confirm_yes_;
+                    ApplyWifiConfirmOptionVisuals();
+                    ESP_LOGI(TAG, "Change Wi-Fi confirm highlight: %s",
+                             wifi_confirm_yes_ ? "Yes" : "No");
+                    return true;
+                case WheelMode::TasksPlaceholder:
+                    // Rotate ignored; click exits.
+                    return true;
+                case WheelMode::Inactive:
+                default:
+                    return false;
+            }
+#endif
+        }
+
+        bool HandleWheelClick() {
+#if W13_V4_UI_BENCH_MODE
+            return false;
+#else
+            DisplayLockGuard lock(this);
+            switch (wheel_mode_) {
+                case WheelMode::Browse:
+                    if (!IsMenuScreen()) {
+                        return false;
+                    }
+                    ActivateSelectedMenuItem();
+                    return true;
+                case WheelMode::VolumeAdjust:
+                    ESP_LOGI(TAG, "Wheel volume adjust exit");
+                    ReturnToMainWithSelection();
+                    return true;
+                case WheelMode::TasksPlaceholder:
+                    ESP_LOGI(TAG, "Tasks placeholder exit");
+                    ReturnToMainWithSelection();
+                    return true;
+                case WheelMode::WifiConfirm:
+                    if (wifi_confirm_yes_) {
+                        // Prototype only — do NOT erase credentials / enter config.
+                        ESP_LOGW(TAG,
+                                 "Change Wi-Fi confirmation reached: YES "
+                                 "(credentials NOT erased — prototype only)");
+                    } else {
+                        ESP_LOGI(TAG, "Change Wi-Fi confirmation: No — cancelled");
+                    }
+                    ReturnToMainWithSelection();
+                    return true;
+                case WheelMode::Inactive:
+                default:
+                    return false;
+            }
 #endif
         }
 
@@ -1306,30 +1635,34 @@ private:
         return;
 #endif
 
-        // Stock SenseCap: knob rotation adjusts volume. No V4 menu selection yet.
-        auto codec = GetAudioCodec();
-        int current_volume = codec->output_volume();
-        int new_volume = current_volume + (clockwise ? -5 : 5);
+        // Wheel menu owns rotation on Main/Listening/Speaking and in adjust/confirm modes.
+        auto* v4 = static_cast<CustomLcdDisplay*>(GetDisplay());
+        if (v4->HandleWheelRotate(clockwise)) {
+            return;
+        }
+        // Non-menu screens: wake only (no global volume steal).
+    }
 
-        // 确保音量在有效范围内
-        if (new_volume > 100) {
-            new_volume = 100;
-            ESP_LOGW(TAG, "Volume reached maximum limit: %d", new_volume);
-        } else if (new_volume < 0) {
-            new_volume = 0;
-            ESP_LOGW(TAG, "Volume reached minimum limit: %d", new_volume);
+    void OnKnobClick() {
+        power_save_timer_->WakeUp();
+
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() == kDeviceStateStarting) {
+            EnterWifiConfigMode();
+            return;
         }
 
-        codec->SetOutputVolume(new_volume);
-        ESP_LOGI(TAG, "Volume changed from %d to %d", current_volume, new_volume);
+#if W13_V4_UI_BENCH_MODE
+        app.ToggleChatState();
+        return;
+#endif
 
-        // 显示通知前检查实际变化
-        if (new_volume != codec->output_volume()) {
-            ESP_LOGE(TAG, "Failed to set volume! Expected:%d Actual:%d", new_volume,
-                     codec->output_volume());
+        auto* v4 = static_cast<CustomLcdDisplay*>(GetDisplay());
+        if (v4->HandleWheelClick()) {
+            return;
         }
-        GetDisplay()->ShowNotification(std::string(Lang::Strings::VOLUME) + ": " +
-                                       std::to_string(codec->output_volume()));
+        // Fallback outside wheel modes (e.g. boot/provision): preserve Talk toggle.
+        app.ToggleChatState();
     }
 
     void InitializeKnob() {
@@ -1365,14 +1698,7 @@ private:
         
         iot_button_register_cb(btns, BUTTON_SINGLE_CLICK, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<SensecapWatcher*>(usr_data);
-            self->power_save_timer_->WakeUp();
-
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting) {
-                self->EnterWifiConfigMode();
-                return;
-            }
-            app.ToggleChatState();
+            self->OnKnobClick();
         }, this);
         
         iot_button_register_cb(btns, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
