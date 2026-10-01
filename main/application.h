@@ -118,7 +118,13 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
-    
+
+    /**
+     * True during Change Wi-Fi reconnect while ActivationTask runs without binding.
+     * V4 uses this to suppress the Binding UI.
+     */
+    bool ShouldSuppressBindingUi() const { return suppress_binding_ui_; }
+
     /**
      * Reset protocol resources (thread-safe)
      * Can be called from any task to release resources allocated after network connected
@@ -151,6 +157,7 @@ private:
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
+    bool suppress_binding_ui_ = false;  // Change Wi-Fi reconnect: Activating without Binding UI
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 

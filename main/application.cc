@@ -290,7 +290,38 @@ void Application::HandleNetworkConnectedEvent() {
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
-        // Network is ready, start activation
+        // Change Wi-Fi pending marker (NVS app/cwifi_pend): existing device reconnect
+        // must still enter Activating (state machine), but skip Binding + Ota::Activate.
+        bool change_wifi_pending = false;
+        {
+            Settings app_settings("app", false);
+            change_wifi_pending = app_settings.GetBool("cwifi_pend", false);
+        }
+        bool has_ws_identity = false;
+        {
+            Settings ws_settings("websocket", false);
+            has_ws_identity = !ws_settings.GetString("token").empty();
+        }
+
+        suppress_binding_ui_ = change_wifi_pending && has_ws_identity;
+        if (change_wifi_pending) {
+            // Always clear marker after successful handling (skip or fall-through).
+            Settings app_settings("app", true);
+            app_settings.SetBool("cwifi_pend", false);
+            if (suppress_binding_ui_) {
+                ESP_LOGI(TAG,
+                         "Change Wi-Fi reconnect with existing identity — skipping activation "
+                         "(Binding UI suppressed; OTA/protocol continue)");
+            } else {
+                ESP_LOGW(TAG,
+                         "Change Wi-Fi marker set but no websocket identity — "
+                         "continuing normal activation");
+            }
+        }
+
+        // Legal path: WifiConfiguring/Starting → Activating → (task) → Idle.
+        // Tier B still uses Activating for CheckVersion/InitializeProtocol; Activate is
+        // skipped via suppress_binding_ui_ + CheckNewVersion token defense-in-depth.
         SetDeviceState(kDeviceStateActivating);
         if (activation_task_handle_ != nullptr) {
             ESP_LOGW(TAG, "Activation task already running");
@@ -333,6 +364,7 @@ void Application::HandleActivationDoneEvent() {
     ESP_LOGI(TAG, "Activation done");
 
     SystemInfo::PrintHeapStats();
+    suppress_binding_ui_ = false;
     SetDeviceState(kDeviceStateIdle);
 
     has_server_time_ = ota_->HasServerTime();

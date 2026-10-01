@@ -13,6 +13,7 @@
 #include "lvgl_theme.h"
 #include "nexus_wifi_qr.h"
 #include "ssid_manager.h"
+#include "settings.h"
 
 #include <esp_log.h>
 #include <esp_check.h>
@@ -1094,7 +1095,12 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                     }
                     break;
                 case kDeviceStateActivating:
-                    ShowBindingScreen(binding_ui_shown_);
+                    // Change Wi-Fi reconnect: stay on waiting visuals — no Binding copy.
+                    if (Application::GetInstance().ShouldSuppressBindingUi()) {
+                        ShowWaitingWifiScreen();
+                    } else {
+                        ShowBindingScreen(binding_ui_shown_);
+                    }
                     break;
                 case kDeviceStateListening:
                     ShowListeningScreen();
@@ -1436,19 +1442,41 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             }
 
             if (clear_wifi_and_reboot) {
+                // Persist Change Wi-Fi marker BEFORE Clear+Reboot so SoftAP reconnect
+                // can skip Binding/Activate. Namespace app / key cwifi_pend (≤15 chars).
+                {
+                    Settings app_settings("app", true);
+                    app_settings.SetBool("cwifi_pend", true);
+                }
+                {
+                    Settings app_settings("app", false);
+                    if (!app_settings.GetBool("cwifi_pend", false)) {
+                        ESP_LOGE(TAG,
+                                 "Change Wi-Fi: failed to persist cwifi_pend marker — "
+                                 "aborting Clear/reboot");
+                        DisplayLockGuard lock(this);
+                        ReturnFromOverlayWithSelection();
+                        return true;
+                    }
+                }
+
                 // Credential keys only via SsidManager — never nvs_flash_erase / namespace wipe.
                 auto& ssids = SsidManager::GetInstance();
                 ssids.Clear();  // void; verify by empty list
                 if (!ssids.GetSsidList().empty()) {
                     ESP_LOGE(TAG, "Change Wi-Fi: SsidManager::Clear() left %u network(s)",
                              (unsigned)ssids.GetSsidList().size());
+                    {
+                        Settings app_settings("app", true);
+                        app_settings.SetBool("cwifi_pend", false);
+                    }
                     DisplayLockGuard lock(this);
                     ReturnFromOverlayWithSelection();
                     return true;
                 }
                 ESP_LOGW(TAG,
                          "Change Wi-Fi: saved STA credentials cleared; rebooting to provisioning "
-                         "(UUID / websocket / ota_url preserved)");
+                         "(UUID / websocket / ota_url preserved; cwifi_pend set)");
                 Application::GetInstance().Reboot();
                 // Reboot does not return under normal conditions.
                 return true;
@@ -1547,13 +1575,25 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             }
 
             if (strcmp(status, Lang::Strings::ACTIVATION) == 0) {
+                if (Application::GetInstance().ShouldSuppressBindingUi()) {
+                    ShowWaitingWifiScreen();
+                    return;
+                }
                 ShowBindingScreen(true);
                 return;
             }
 
             // Post-Wi-Fi OTA check during first-time setup → binding visuals.
             // Do not map routine reboot version checks or LOADING_PROTOCOL here.
+            // Change Wi-Fi reconnect: keep WaitingWifi — never show Binding.
             if (strcmp(status, Lang::Strings::CHECKING_NEW_VERSION) == 0) {
+                if (Application::GetInstance().ShouldSuppressBindingUi()) {
+                    if (screen_ == V4Screen::ProvisionQr || screen_ == V4Screen::WaitingWifi ||
+                        screen_ == V4Screen::Binding) {
+                        ShowWaitingWifiScreen();
+                    }
+                    return;
+                }
                 if (screen_ == V4Screen::ProvisionQr || screen_ == V4Screen::WaitingWifi ||
                     screen_ == V4Screen::Binding) {
                     ShowBindingScreen(false);
@@ -1576,6 +1616,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                     // Real activation/binding finished → ready splash, then main.
                     ShowReadySplashScreen();
                 } else if (!ready_splash_active_) {
+                    // Change Wi-Fi reconnect never sets binding_ui_shown_ → Main directly.
                     ShowMainScreen();
                 }
                 return;
