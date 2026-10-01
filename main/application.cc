@@ -443,6 +443,21 @@ void Application::CheckNewVersion() {
     int retry_count = 0;
     int retry_delay = 10;  // Initial retry delay in seconds
 
+    // Snapshot websocket identity BEFORE CheckVersion — that path may overwrite NVS
+    // when the OTA response includes a websocket section (Change Wi-Fi rebind risk).
+    std::string preserved_ws_token;
+    std::string preserved_ws_url;
+    int32_t preserved_ws_version = 0;
+    bool had_existing_ws_identity = false;
+    {
+        Settings ws_settings("websocket", false);
+        preserved_ws_token = ws_settings.GetString("token");
+        preserved_ws_url = ws_settings.GetString("url");
+        preserved_ws_version = ws_settings.GetInt("version", 0);
+        // Existing device = non-empty token (url alone is not sufficient).
+        had_existing_ws_identity = !preserved_ws_token.empty();
+    }
+
     auto& board = Board::GetInstance();
     while (true) {
         auto display = board.GetDisplay();
@@ -498,11 +513,30 @@ void Application::CheckNewVersion() {
 
         // No new version, mark the current version as valid
         ota_->MarkCurrentVersionValid();
+
+        // EXISTING DEVICE (Change Wi-Fi / normal reboot with token): preserve identity,
+        // skip Activate and ACTIVATION UI even if server returned an activation object.
+        if (had_existing_ws_identity) {
+            Settings ws_settings("websocket", true);
+            if (ws_settings.GetString("token") != preserved_ws_token ||
+                ws_settings.GetString("url") != preserved_ws_url ||
+                ws_settings.GetInt("version", 0) != preserved_ws_version) {
+                ESP_LOGW(TAG, "Restoring preserved websocket identity after CheckVersion");
+                ws_settings.SetString("token", preserved_ws_token);
+                ws_settings.SetString("url", preserved_ws_url);
+                ws_settings.SetInt("version", preserved_ws_version);
+            }
+            ESP_LOGI(TAG, "Existing device identity found — skipping activation");
+            break;
+        }
+
         if (!ota_->HasActivationCode() && !ota_->HasActivationChallenge()) {
             // Exit the loop if done checking new version
             break;
         }
 
+        // NEW DEVICE: no prior websocket token — keep first-time binding behavior.
+        ESP_LOGI(TAG, "New device activation required");
         display->SetStatus(Lang::Strings::ACTIVATION);
         // Activation code is shown to the user and waiting for the user to input
         if (ota_->HasActivationCode()) {
